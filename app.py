@@ -1,98 +1,158 @@
-from flask import Flask, request
+import os
+import json
 import requests
+from flask import Flask, request
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 from datetime import datetime
 
 app = Flask(__name__)
 
-# Google Sheets setup
+# ==========================
+# Google Sheets Setup
+# ==========================
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+
+# Load credentials JSON from Render env variable
+creds_json = os.getenv("GOOGLE_CREDS_JSON")
+creds_dict = json.loads(creds_json)
+
+creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
 client = gspread.authorize(creds)
-sheet = client.open("Kalagato Leads").sheet1  # Create this sheet in your Google Drive
 
-# Store user states
-user_states = {}
+# Open your Google Sheet
+sheet = client.open("Whatsapp_bot_AK").worksheet("Sheet1")
 
+# ==========================
+# WhatsApp API Setup
+# ==========================
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+TOKEN = os.getenv("META_ACCESS_TOKEN")
+WHATSAPP_API_URL = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+
+HEADERS = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Content-Type": "application/json"
+}
+
+# ==========================
+# Conversation Flow
+# ==========================
 questions = [
     "What is your app name?",
-    "Please share your app link (Play Store / App Store).",
-    "What was your revenue in the last 12 months?",
-    "What was your profit in the last 12 months?",
-    "What were your spends in the last 12 months?",
-    "How many Daily Active Users (DAU) do you have?",
-    "How many Monthly Active Users (MAU) do you have?",
-    "What is your Day 1 retention (%)?",
-    "What is your Day 7 retention (%)?",
-    "What is your Day 30 retention (%)?"
+    "Please share your app link.",
+    "What is your last 12 months revenue?",
+    "What is your last 12 months profit?",
+    "What is your last 12 months spends?",
+    "What are your Daily Active Users (DAU)?",
+    "What are your Monthly Active Users (MAU)?",
+    "What is your Retention Day 1?",
+    "What is your Retention Day 7?",
+    "What is your Retention Day 30?"
 ]
 
-# WhatsApp API setup
-WHATSAPP_API_URL = "https://graph.facebook.com/v20.0/YOUR_PHONE_NUMBER_ID/messages"
-TOKEN = "YOUR_META_ACCESS_TOKEN"
+user_sessions = {}
 
-def send_whatsapp_message(to, text, buttons=None):
-    headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product": "whatsapp", "to": to}
-    
+# ==========================
+# Helper Functions
+# ==========================
+def send_message(to, text, buttons=None):
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive" if buttons else "text",
+    }
     if buttons:
-        payload["type"] = "interactive"
-        payload["interactive"] = {
+        data["interactive"] = {
             "type": "button",
             "body": {"text": text},
-            "action": {"buttons": [{"type": "reply", "reply": {"id": b["id"], "title": b["title"]}} for b in buttons]}
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": str(i), "title": btn}}
+                    for i, btn in enumerate(buttons)
+                ]
+            },
         }
     else:
-        payload["type"] = "text"
-        payload["text"] = {"body": text}
-    
-    requests.post(WHATSAPP_API_URL, headers=headers, json=payload)
+        data["text"] = {"body": text}
+
+    requests.post(WHATSAPP_API_URL, headers=HEADERS, json=data)
+
+def save_to_sheet(user_id, responses):
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    row = [now, user_id] + responses
+    sheet.append_row(row)
+
+# ==========================
+# Webhook Routes
+# ==========================
+@app.route("/webhook", methods=["GET"])
+def verify():
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    if token == "kalagato123":  # must match your Verify Token in Meta
+        return challenge
+    return "Unauthorized", 403
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
-    if "messages" in data["entry"][0]["changes"][0]["value"]:
-        msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
-        sender = msg["from"]
-        text = msg.get("text", {}).get("body", "").strip()
-        button_reply = msg.get("interactive", {}).get("button_reply", {}).get("id")
 
-        # New user greeting
-        if sender not in user_states:
-            if text.lower() in ["hi", "hello"]:
-                user_states[sender] = {"stage": "ask_interest", "answers": []}
-                send_whatsapp_message(
-                    sender,
-                    "Hi, I am Kalagato AI Agent. Are you interested in selling your app?",
-                    buttons=[{"id": "yes", "title": "Yes"}, {"id": "no", "title": "No"}]
-                )
+    if data.get("entry"):
+        for entry in data["entry"]:
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                messages = value.get("messages", [])
 
-        elif user_states[sender]["stage"] == "ask_interest":
-            if button_reply == "yes":
-                user_states[sender]["stage"] = 0
-                send_whatsapp_message(sender, questions[0])
-            elif button_reply == "no":
-                send_whatsapp_message(sender, "If you have any queries, contact us at aman@kalagato.co")
-                user_states.pop(sender)
+                for message in messages:
+                    user_id = message["from"]
+                    text = None
 
-        elif isinstance(user_states[sender]["stage"], int):
-            q_index = user_states[sender]["stage"]
-            user_states[sender]["answers"].append(text)
+                    if "text" in message:
+                        text = message["text"]["body"].strip().lower()
+                    elif message.get("interactive"):
+                        text = message["interactive"]["button_reply"]["title"].lower()
 
-            if q_index + 1 < len(questions):
-                user_states[sender]["stage"] += 1
-                send_whatsapp_message(sender, questions[q_index + 1])
-            else:
-                # Save responses to Google Sheets
-                row = [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), sender] + user_states[sender]["answers"]
-                sheet.append_row(row)
+                    # Start flow
+                    if text in ["hi", "hello"]:
+                        send_message(
+                            user_id,
+                            "Hi, I am Kalagato AI agent. Are you interested in selling your app?",
+                            ["Yes", "No"]
+                        )
+                        user_sessions[user_id] = {"step": -1, "responses": []}
 
-                send_whatsapp_message(sender, "✅ Thank you! Your responses have been recorded.")
-                user_states.pop(sender)
+                    elif text == "yes":
+                        user_sessions[user_id] = {"step": 0, "responses": []}
+                        send_message(user_id, questions[0])
 
-    return "OK", 200
+                    elif text == "no":
+                        send_message(
+                            user_id,
+                            "Thanks! If you have any queries, contact us at aman@kalagato.co"
+                        )
+                        user_sessions.pop(user_id, None)
 
-@app.route("/", methods=["GET"])
-def home():
-    return "Kalagato WhatsApp Bot Running ✅"
+                    elif user_id in user_sessions:
+                        session = user_sessions[user_id]
+                        step = session["step"]
+
+                        if 0 <= step < len(questions):
+                            session["responses"].append(message["text"]["body"])
+                            session["step"] += 1
+
+                            if session["step"] < len(questions):
+                                send_message(user_id, questions[session["step"]])
+                            else:
+                                # Save all responses to Google Sheet
+                                save_to_sheet(user_id, session["responses"])
+                                send_message(user_id, "Thank you! Your responses have been saved.")
+                                user_sessions.pop(user_id, None)
+
+    return "ok", 200
+
+# ==========================
+# Run App
+# ==========================
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
