@@ -41,9 +41,9 @@ HEADERS = {
 questions = [
     "What is your app name?",
     "Please share your app link.",
-    "What is your last 12 months revenue?",
-    "What is your last 12 months profit?",
-    "What is your last 12 months spends?",
+    "What is your last 12 months revenue? Provide figures in USD",
+    "What is your last 12 months profit? Provide figures in USD",
+    "What is your last 12 months spends? Provide figures in USD",
     "What are your Daily Active Users (DAU)?",
     "What are your Monthly Active Users (MAU)?",
     "What is your Retention Day 1?",
@@ -114,7 +114,7 @@ def webhook():
                         text = message["interactive"]["button_reply"]["title"].lower()
 
                     # Start flow
-                    if text in ["hi", "hello"]:
+                    if text in ["hi", "hello","hey","hy","good morning","good evening"]:
                         send_message(
                             user_id,
                             "Hi, I am Kalagato AI agent. Are you interested in selling your app?",
@@ -146,7 +146,7 @@ def webhook():
                             else:
                                 # Save all responses to Google Sheet
                                 save_to_sheet(user_id, session["responses"])
-                                send_message(user_id, "Thank you! Your responses have been saved.")
+                                send_message(user_id, "Thank you! Your responses have been saved.We will connect with you ASAP")
                                 user_sessions.pop(user_id, None)
 
     return "ok", 200
