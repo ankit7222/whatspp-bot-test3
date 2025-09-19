@@ -1,164 +1,181 @@
 import os
-import datetime
-from flask import Flask, request, jsonify
+import json
+from flask import Flask, request
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
 
 app = Flask(__name__)
 
-# ------------------- GOOGLE SHEETS SETUP -------------------
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-client = gspread.authorize(creds)
+# ===================== GOOGLE SHEETS SETUP =====================
+SHEET_NAME = os.getenv("SHEET_NAME")
 
-SHEET_NAME = "YourSheetName"  # <-- replace with your Google Sheet name
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds_json = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
+client = gspread.authorize(creds)
 sheet = client.open(SHEET_NAME).sheet1
 
-# ------------------- QUESTIONS -------------------
-questions = {
-    "listing": "Is your app listed on App Store, Play Store, or Both?",
-    "app_store_link": "Please share your App Store link:",
-    "play_store_link": "Please share your Play Store link:",
-    "revenue": "What was your last 12 months revenue (number only)?",
-    "profit": "What was your last 12 months profit (number only)?",
-    "spends": "What was your last 12 months spends (number only)?",
-    "monthly_profit": "What is your Monthly Profit (number only)?",
-    "dau": "How many Daily Active Users (DAU)?",
-    "mau": "How many Monthly Active Users (MAU)?"
+# ===================== WHATSAPP API SETUP =====================
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+
+WHATSAPP_API_URL = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
+HEADERS = {
+    "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+    "Content-Type": "application/json"
 }
 
-flow_order = ["listing", "app_store_link", "play_store_link",
-              "revenue", "profit", "spends",
-              "monthly_profit", "dau", "mau"]
+# ===================== CONVERSATION STATE =====================
+user_states = {}
 
-# Track user answers in memory (in production use DB/Redis)
-user_answers = {}
+questions = [
+    "Is your app listed on App Store, Play Store, or Both?",
+    "Please provide the App Store link (if applicable).",
+    "Please provide the Play Store link (if applicable).",
+    "What is your last 12 months revenue? (Numbers only)",
+    "What is your last 12 months profit? (Numbers only)",
+    "What is your last 12 months spends? (Numbers only)",
+    "What is your monthly profit? (Numbers only)",
+    "What is your Daily Active Users (DAU)? (Numbers only)",
+    "What is your Monthly Active Users (MAU)? (Numbers only)"
+]
 
-# ------------------- NEXT QUESTION LOGIC -------------------
-def get_next_question(user_number):
-    answers = user_answers.get(user_number, {})
-
-    if "listing" not in answers:
-        return "listing"
-
-    listing = answers.get("listing", "").lower()
-
-    if listing == "app store":
-        if "app_store_link" not in answers:
-            return "app_store_link"
-        return next_in_order(answers, skip="play_store_link")
-
-    elif listing == "play store":
-        if "play_store_link" not in answers:
-            return "play_store_link"
-        return next_in_order(answers, skip="app_store_link")
-
-    elif listing == "both":
-        if "app_store_link" not in answers:
-            return "app_store_link"
-        if "play_store_link" not in answers:
-            return "play_store_link"
-        return next_in_order(answers)
-
-    return next_in_order(answers)
-
-def next_in_order(answers, skip=None):
-    for q in flow_order:
-        if skip and q == skip:
-            continue
-        if q not in answers:
-            return q
-    return None
-
-# ------------------- SAVE TO SHEETS -------------------
-def save_to_google_sheets(user_number, answers):
-    date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    row = [
-        date,
-        user_number,
-        answers.get("listing", ""),
-        answers.get("app_store_link", ""),
-        answers.get("play_store_link", ""),
-        answers.get("revenue", ""),
-        answers.get("profit", ""),
-        answers.get("spends", ""),
-        answers.get("monthly_profit", ""),
-        answers.get("dau", ""),
-        answers.get("mau", "")
-    ]
-    sheet.append_row(row)
-
-    # Highlight monthly profit if >= 7000
-    try:
-        monthly_profit = float(answers.get("monthly_profit", 0))
-        if monthly_profit >= 7000:
-            last_row = len(sheet.get_all_values())
-            sheet.format(f"I{last_row}", {  # I = Monthly Profit column (after adding WhatsApp Number)
-                "backgroundColor": {"red": 0.8, "green": 1, "blue": 0.8}
-            })
-    except:
-        pass
-
-# ------------------- WHATSAPP API -------------------
-WHATSAPP_API_URL = "https://graph.facebook.com/v17.0/YOUR_PHONE_NUMBER_ID/messages"
-WHATSAPP_TOKEN = "YOUR_PERMANENT_ACCESS_TOKEN"
-
-def send_whatsapp_message(to, text):
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
+# ===================== HELPER FUNCTIONS =====================
+def send_whatsapp_message(to, text, buttons=None):
     data = {
         "messaging_product": "whatsapp",
         "to": to,
-        "type": "text",
-        "text": {"body": text}
+        "type": "interactive" if buttons else "text"
     }
-    requests.post(WHATSAPP_API_URL, headers=headers, json=data)
+    if buttons:
+        data["interactive"] = {
+            "type": "button",
+            "body": {"text": text},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": b.lower(), "title": b}}
+                    for b in buttons
+                ]
+            }
+        }
+    else:
+        data["text"] = {"body": text}
 
-# ------------------- WEBHOOK -------------------
+    requests.post(WHATSAPP_API_URL, headers=HEADERS, json=data)
+
+def validate_answer(step, text):
+    """Validate user responses by step index"""
+    if step == 1 and not text.lower() in ["app store", "play store", "both"]:
+        return False, "❌ Please reply with 'App Store', 'Play Store', or 'Both'."
+
+    if step == 2 and not text.startswith("https://apps.apple.com"):
+        return False, "❌ Invalid App Store link. Please provide a valid URL."
+
+    if step == 3 and not text.startswith("https://play.google.com"):
+        return False, "❌ Invalid Play Store link. Please provide a valid URL."
+
+    if step in [4, 5, 6, 7, 8] and not text.replace(".", "").isdigit():
+        return False, "❌ Please enter a valid number."
+
+    return True, None
+
+def save_to_sheet(user_id, responses):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = [now, user_id] + responses
+    sheet.append_row(row)
+
+    # Highlight monthly profit cell if >= 7000
+    try:
+        monthly_profit = float(responses[6])  # index 6 = Monthly Profit
+        row_number = len(sheet.get_all_values())  # new row index
+        if monthly_profit >= 7000:
+            sheet.format(f"I{row_number}", {"backgroundColor": {"red": 0.6, "green": 0.9, "blue": 0.6}})
+    except:
+        pass
+
+# ===================== WEBHOOK ENDPOINT =====================
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        verify_token = "your_verify_token"
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge")
-        if mode == "subscribe" and token == verify_token:
-            return challenge, 200
-        else:
-            return "Verification failed", 403
+        if request.args.get("hub.verify_token") == VERIFY_TOKEN:
+            return request.args.get("hub.challenge")
+        return "Invalid verification token", 403
 
-    if request.method == "POST":
-        data = request.get_json()
-        try:
-            user_number = data['entry'][0]['changes'][0]['value']['messages'][0]['from']
-            message_body = data['entry'][0]['changes'][0]['value']['messages'][0]['text']['body'].strip()
+    data = request.get_json()
+    if "entry" in data:
+        for entry in data["entry"]:
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                messages = value.get("messages", [])
+                if messages:
+                    msg = messages[0]
+                    user_id = msg["from"]
+                    text = msg.get("text", {}).get("body", "").strip()
+                    button_reply = msg.get("interactive", {}).get("button_reply", {}).get("id")
 
-            if user_number not in user_answers:
-                user_answers[user_number] = {}
+                    if user_id not in user_states:
+                        if text.lower() in ["hi", "hello"]:
+                            send_whatsapp_message(
+                                user_id,
+                                "Hi, I am Kalagato AI Agent. Are you interested in selling your app?",
+                                ["Yes", "No"]
+                            )
+                            user_states[user_id] = {"step": 0, "responses": []}
+                        continue
 
-            # Save the latest answer
-            next_q = get_next_question(user_number)
-            if next_q:
-                user_answers[user_number][next_q] = message_body
+                    state = user_states[user_id]
+                    step = state["step"]
 
-            # Get next question
-            next_q = get_next_question(user_number)
-            if next_q:
-                send_whatsapp_message(user_number, questions[next_q])
-            else:
-                # Save and finish
-                save_to_google_sheets(user_number, user_answers[user_number])
-                send_whatsapp_message(user_number, "✅ Thanks! Your details have been saved. If you have queries, email us at aman@kalagato.co")
-                del user_answers[user_number]
+                    # Handle "No"
+                    if button_reply == "no":
+                        send_whatsapp_message(user_id, "Thanks, if you have any queries contact us on aman@kalagato.co")
+                        del user_states[user_id]
+                        continue
 
-        except Exception as e:
-            print("Error:", e)
+                    # Handle "Yes"
+                    if button_reply == "yes" and step == 0:
+                        state["step"] = 1
+                        send_whatsapp_message(user_id, questions[0])
+                        continue
 
-        return "EVENT_RECEIVED", 200
+                    # Validate responses
+                    valid, error_msg = validate_answer(step, text)
+                    if not valid:
+                        send_whatsapp_message(user_id, error_msg)
+                        continue
+
+                    # Save valid response
+                    state["responses"].append(text)
+
+                    # Conditional skipping for listing type
+                    if step == 1:
+                        listing = text.lower()
+                        if listing == "app store":
+                            state["step"] = 2
+                            send_whatsapp_message(user_id, questions[1])
+                            continue
+                        elif listing == "play store":
+                            state["step"] = 3
+                            send_whatsapp_message(user_id, questions[2])
+                            continue
+                        elif listing == "both":
+                            state["step"] = 2
+                            send_whatsapp_message(user_id, questions[1])
+                            continue
+
+                    # Move to next question
+                    state["step"] += 1
+                    if state["step"] < len(questions):
+                        send_whatsapp_message(user_id, questions[state["step"]])
+                    else:
+                        save_to_sheet(user_id, state["responses"])
+                        send_whatsapp_message(user_id, "✅ Thank you! Your responses have been saved.")
+                        del user_states[user_id]
+
+    return "OK", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(port=5000, debug=True)
