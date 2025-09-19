@@ -55,34 +55,33 @@ def send_whatsapp_message(to, text, buttons=None):
     requests.post(WHATSAPP_API_URL, headers=HEADERS, json=data)
 
 def get_questions_for_user(listing):
+    """Generate user-specific question list based on listing selection"""
     q = []
     if listing in ["app store", "both"]:
-        q.append("Please provide the App Store link (if applicable).")
+        q.append("Please provide the App Store link.")
     if listing in ["play store", "both"]:
-        q.append("Please provide the Play Store link (if applicable).")
+        q.append("Please provide the Play Store link.")
+    # Always add numeric questions
     q += [
         "What is your last 12 months revenue? (Numbers only)",
         "What is your last 12 months profit? (Numbers only)",
         "What is your last 12 months spends? (Numbers only)",
-        "What is your monthly profit? (Numbers only)",
+        "What is your average monthly profit? (Numbers only)",
         "What is your Daily Active Users (DAU)? (Numbers only)",
         "What is your Monthly Active Users (MAU)? (Numbers only)"
     ]
     return q
 
 def validate_answer(step, text, user_state):
-    listing = user_state["responses"][0].lower() if user_state["responses"] else ""
+    """Validate answer based on current question"""
     current_question = user_state["questions"][step]
 
-    # Validate links
     if "app store link" in current_question.lower():
         if not text.startswith("https://apps.apple.com"):
             return False, "❌ Invalid App Store link. Please provide a valid URL."
     if "play store link" in current_question.lower():
         if not text.startswith("https://play.google.com"):
             return False, "❌ Invalid Play Store link. Please provide a valid URL."
-
-    # Validate numeric
     if any(x in current_question.lower() for x in ["revenue", "profit", "spends", "dau", "mau"]):
         if not text.replace(".", "").isdigit():
             return False, "❌ Please enter a valid number."
@@ -96,23 +95,21 @@ def save_to_sheet(user_id, state):
     app_store_link = ""
     play_store_link = ""
 
-    if listing == "app store":
-        app_store_link = state["responses"][index]
-        index += 1
-    elif listing == "play store":
-        play_store_link = state["responses"][index]
-        index += 1
-    elif listing == "both":
-        app_store_link = state["responses"][index]
-        index += 1
-        play_store_link = state["responses"][index]
-        index += 1
+    # Map links correctly
+    for q, resp in zip(state["questions"], state["responses"][1:]):
+        if "app store link" in q.lower():
+            app_store_link = resp
+        elif "play store link" in q.lower():
+            play_store_link = resp
 
-    remaining = state["responses"][index:]
-    row = [now, user_id, listing, app_store_link, play_store_link] + remaining
+    # Remaining numeric responses
+    numeric_responses = [resp for q, resp in zip(state["questions"], state["responses"][1:]) 
+                         if any(x in q.lower() for x in ["revenue", "profit", "spends", "monthly profit", "dau", "mau"])]
+
+    row = [now, user_id, listing, app_store_link, play_store_link] + numeric_responses
     sheet.append_row(row)
 
-    # Highlight monthly profit if >=7000
+    # Highlight monthly profit (index 8)
     try:
         monthly_profit = float(row[8])
         row_number = len(sheet.get_all_values())
@@ -141,8 +138,9 @@ def webhook():
                     text = msg.get("text", {}).get("body", "").strip()
                     button_reply = msg.get("interactive", {}).get("button_reply", {}).get("id")
 
+                    # New user greeting
                     if user_id not in user_states:
-                        if text.lower() in ["hi", "hello"]:
+                        if text.lower() in ["hi", "hello","hy","good morning","good evening"]:
                             send_whatsapp_message(
                                 user_id,
                                 "Hi, I am Kalagato AI Agent. Are you interested in selling your app?",
@@ -192,7 +190,7 @@ def webhook():
                         send_whatsapp_message(user_id, state["questions"][state["step"]])
                     else:
                         save_to_sheet(user_id, state)
-                        send_whatsapp_message(user_id, "✅ Thank you! Your responses have been saved.")
+                        send_whatsapp_message(user_id, "✅ Thank you! Your responses have been saved in our database we will contact you ASAP")
                         del user_states[user_id]
 
     return "OK", 200
