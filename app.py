@@ -32,8 +32,8 @@ HEADERS = {
 user_states = {}
 
 questions = [
-    "Please provide the App Store link (if applicable).",
-    "Please provide the Play Store link (if applicable).",
+    "Please provide the App Store link.",
+    "Please provide the Play Store link.",
     "What is your last 12 months revenue? (Numbers only)",
     "What is your last 12 months profit? (Numbers only)",
     "What is your last 12 months spends? (Numbers only)",
@@ -87,13 +87,37 @@ def validate_answer(step, text, user_state):
 
 def save_to_sheet(user_id, responses):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row = [now, user_id] + responses
+    listing = responses[0].lower()
+
+    # Initialize link columns
+    app_store_link = ""
+    play_store_link = ""
+
+    # Fill links based on selection
+    index = 1  # responses index after listing
+    if listing == "app store":
+        app_store_link = responses[index]
+        index += 1
+    elif listing == "play store":
+        play_store_link = responses[index]
+        index += 1
+    elif listing == "both":
+        app_store_link = responses[index]
+        index += 1
+        play_store_link = responses[index]
+        index += 1
+
+    # Remaining responses: revenue, profit, spends, monthly profit, DAU, MAU
+    remaining = responses[index:]
+
+    # Final row to append
+    row = [now, user_id, listing, app_store_link, play_store_link] + remaining
     sheet.append_row(row)
 
-    # Highlight monthly profit cell if >= 7000
+    # Highlight monthly profit if >= 7000 (Monthly Profit = index 8)
     try:
-        monthly_profit = float(responses[5])  # index 5 = Monthly Profit
-        row_number = len(sheet.get_all_values())  # new row index
+        monthly_profit = float(row[8])
+        row_number = len(sheet.get_all_values())
         if monthly_profit >= 7000:
             sheet.format(f"I{row_number}", {"backgroundColor": {"red": 0.6, "green": 0.9, "blue": 0.6}})
     except:
@@ -120,11 +144,10 @@ def webhook():
                     button_reply = msg.get("interactive", {}).get("button_reply", {}).get("id")
 
                     if user_id not in user_states:
-                        if text.lower() in ["hi", "hello"]:
-                            # First interactive buttons for "Yes" / "No"
+                        if text.lower() in ["hi", "hello","good morning","good evening","hy","hey"]:
                             send_whatsapp_message(
                                 user_id,
-                                "Hi, I am Kalagato AI Agent. Are you interested in selling your app?",
+                                "Hi, I am KalaGato AI Agent. Are you interested in selling your app?",
                                 ["Yes", "No"]
                             )
                             user_states[user_id] = {"step": 0, "responses": []}
@@ -149,11 +172,10 @@ def webhook():
                         )
                         continue
 
-                    # Collect listing answer from button reply
+                    # Listing answer
                     if step == 0:
                         listing_answer = button_reply or text
                         state["responses"].append(listing_answer)
-                        # Decide next question based on listing
                         if listing_answer.lower() == "app store":
                             state["step"] = 1
                             send_whatsapp_message(user_id, questions[0])
@@ -180,7 +202,7 @@ def webhook():
                         send_whatsapp_message(user_id, questions[state["step"]])
                     else:
                         save_to_sheet(user_id, state["responses"])
-                        send_whatsapp_message(user_id, "✅ Thank you! Your responses have been saved.")
+                        send_whatsapp_message(user_id, "✅ Thank you! Your responses have been saved in our database we will cotact with you ASAP")
                         del user_states[user_id]
 
     return "OK", 200
