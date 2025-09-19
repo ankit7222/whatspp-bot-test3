@@ -65,18 +65,22 @@ def send_whatsapp_message(to, text, buttons=None):
 
     requests.post(WHATSAPP_API_URL, headers=HEADERS, json=data)
 
-def validate_answer(step, text):
-    """Validate user responses by step index"""
-    if step == 0:
-        return True, None  # listing is handled by button
+def validate_answer(step, text, user_state):
+    """Validate user responses based on step and listing selection"""
+    listing = user_state["responses"][0].lower() if user_state["responses"] else ""
 
-    if step == 1 and text and not text.startswith("https://apps.apple.com"):
-        return False, "❌ Invalid App Store link. Please provide a valid URL."
+    # Step 1: App Store link
+    if step == 1 and ("app store" in listing or "both" in listing):
+        if not text.startswith("https://apps.apple.com"):
+            return False, "❌ Invalid App Store link. Please provide a valid URL."
 
-    if step == 2 and text and not text.startswith("https://play.google.com"):
-        return False, "❌ Invalid Play Store link. Please provide a valid URL."
+    # Step 2: Play Store link
+    if step == 2 and ("play store" in listing or "both" in listing):
+        if not text.startswith("https://play.google.com"):
+            return False, "❌ Invalid Play Store link. Please provide a valid URL."
 
-    if step in [3,4,5,6,7] and not text.replace(".", "").isdigit():
+    # Numeric validations
+    if step >= 3 and not text.replace(".", "").isdigit():
         return False, "❌ Please enter a valid number."
 
     return True, None
@@ -117,7 +121,7 @@ def webhook():
 
                     if user_id not in user_states:
                         if text.lower() in ["hi", "hello"]:
-                            # Send first interactive buttons for "Yes" / "No"
+                            # First interactive buttons for "Yes" / "No"
                             send_whatsapp_message(
                                 user_id,
                                 "Hi, I am Kalagato AI Agent. Are you interested in selling your app?",
@@ -138,7 +142,6 @@ def webhook():
                     # Handle "Yes"
                     if button_reply == "yes" and step == 0:
                         state["step"] = 0
-                        # Send listing question as interactive buttons
                         send_whatsapp_message(
                             user_id,
                             "Is your app listed on App Store, Play Store, or Both?",
@@ -163,7 +166,7 @@ def webhook():
                         continue
 
                     # Validate responses
-                    valid, error_msg = validate_answer(step, text)
+                    valid, error_msg = validate_answer(step, text, state)
                     if not valid:
                         send_whatsapp_message(user_id, error_msg)
                         continue
