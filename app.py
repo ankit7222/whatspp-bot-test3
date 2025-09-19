@@ -1,191 +1,173 @@
 import os
 import json
-from flask import Flask, request
 import requests
+from flask import Flask, request
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
-# ===================== GOOGLE SHEETS SETUP =====================
-SHEET_NAME = os.getenv("SHEET_NAME")
+# --- Google Sheets setup ---
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SERVICE_ACCOUNT_INFO = json.loads(os.getenv("GOOGLE_SHEETS_CREDENTIALS"))
+creds = Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO, scopes=SCOPES)
 
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds_json = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
-client = gspread.authorize(creds)
-sheet = client.open(SHEET_NAME).sheet1
+gc = gspread.authorize(creds)
+service = build("sheets", "v4", credentials=creds)
 
-# ===================== WHATSAPP API SETUP =====================
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
+
+sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+
+# --- WhatsApp setup ---
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 
 WHATSAPP_API_URL = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
-HEADERS = {
-    "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-    "Content-Type": "application/json"
-}
 
-# ===================== CONVERSATION STATE =====================
-user_states = {}
 
-# ===================== HELPER FUNCTIONS =====================
-def send_whatsapp_message(to, text, buttons=None):
-    data = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "interactive" if buttons else "text"
+# --- Helper: send WhatsApp message ---
+def send_message(to, message, buttons=None):
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
     }
+
     if buttons:
-        data["interactive"] = {
-            "type": "button",
-            "body": {"text": text},
-            "action": {
-                "buttons": [
-                    {"type": "reply", "reply": {"id": b.lower(), "title": b}}
-                    for b in buttons
-                ]
-            }
+        data = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {"text": message},
+                "action": {
+                    "buttons": [
+                        {"type": "reply", "reply": {"id": str(i), "title": btn}}
+                        for i, btn in enumerate(buttons, 1)
+                    ]
+                },
+            },
         }
     else:
-        data["text"] = {"body": text}
+        data = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "text",
+            "text": {"body": {"body": message}},
+        }
 
-    requests.post(WHATSAPP_API_URL, headers=HEADERS, json=data)
+    requests.post(WHATSAPP_API_URL, headers=headers, json=data)
 
-def get_questions_for_user(listing):
-    q = []
-    if listing in ["app store", "both"]:
-        q.append("Please provide the App Store link:")
-    if listing in ["play store", "both"]:
-        q.append("Please provide the Play Store link:")
-    q += [
-        "What is your last 12 months revenue? (Numbers only)",
-        "What is your last 12 months profit? (Numbers only)",
-        "What is your last 12 months spends? (Numbers only)",
-        "What is your monthly profit? (Numbers only)",
-        "What is your Daily Active Users (DAU)? (Numbers only)",
-        "What is your Monthly Active Users (MAU)? (Numbers only)"
-    ]
-    return q
 
-def validate_answer(step, text, user_state):
-    current_question = user_state["questions"][step]
-    if "app store link" in current_question.lower():
-        if not text.startswith("https://apps.apple.com"):
-            return False, "❌ Invalid App Store link. Please provide a valid URL."
-    if "play store link" in current_question.lower():
-        if not text.startswith("https://play.google.com"):
-            return False, "❌ Invalid Play Store link. Please provide a valid URL."
-    if any(x in current_question.lower() for x in ["revenue", "profit", "spends", "dau", "mau"]):
-        if not text.replace(".", "").isdigit():
-            return False, "❌ Please enter a valid number."
-    return True, None
+# --- Conditional Formatting ---
+def get_column_index(column_name):
+    """Find column index (0-based) by header name."""
+    header = sheet.row_values(1)  # first row is header
+    if column_name in header:
+        return header.index(column_name)
+    else:
+        raise ValueError(f"Column '{column_name}' not found in sheet")
 
-def save_to_sheet(user_id, state):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    listing = state["responses"][0].lower()
-    app_store_link = ""
-    play_store_link = ""
-    numeric_responses = []
 
-    for q, resp in zip(state["questions"], state["responses"][1:]):
-        if "app store link" in q.lower():
-            app_store_link = resp
-        elif "play store link" in q.lower():
-            play_store_link = resp
-        else:
-            numeric_responses.append(resp)
-
-    row = [now, user_id, listing, app_store_link, play_store_link] + numeric_responses
-    sheet.append_row(row)
-
+def apply_conditional_formatting():
+    """Color full row green/red based on Monthly Profit."""
     try:
-        monthly_profit = float(row[8])
-        row_number = len(sheet.get_all_values())
-        if monthly_profit >= 7000:
-            sheet.format(f"I{row_number}", {"backgroundColor": {"red": 0.6, "green": 0.9, "blue": 0.6}})
-    except:
-        pass
+        profit_col_index = get_column_index("Monthly Profit")  # dynamic lookup
+        end_col_index = len(sheet.row_values(1))  # auto-adjust to header count
 
-# ===================== WEBHOOK ENDPOINT =====================
+        body = {
+            "requests": [
+                {
+                    "addConditionalFormatRule": {
+                        "rule": {
+                            "ranges": [
+                                {
+                                    "sheetId": 0,
+                                    "startRowIndex": 1,  # skip header
+                                    "startColumnIndex": 0,
+                                    "endColumnIndex": end_col_index,
+                                }
+                            ],
+                            "booleanRule": {
+                                "condition": {
+                                    "type": "CUSTOM_FORMULA",
+                                    "values": [
+                                        {
+                                            "userEnteredValue": f"=${chr(65+profit_col_index)}2>=7000"
+                                        }
+                                    ],
+                                },
+                                "format": {
+                                    "backgroundColor": {
+                                        "red": 0.8,
+                                        "green": 1,
+                                        "blue": 0.8,
+                                    }
+                                },
+                            },
+                        },
+                        "index": 0,
+                    }
+                },
+                {
+                    "addConditionalFormatRule": {
+                        "rule": {
+                            "ranges": [
+                                {
+                                    "sheetId": 0,
+                                    "startRowIndex": 1,
+                                    "startColumnIndex": 0,
+                                    "endColumnIndex": end_col_index,
+                                }
+                            ],
+                            "booleanRule": {
+                                "condition": {
+                                    "type": "CUSTOM_FORMULA",
+                                    "values": [
+                                        {
+                                            "userEnteredValue": f"=${chr(65+profit_col_index)}2<7000"
+                                        }
+                                    ],
+                                },
+                                "format": {
+                                    "backgroundColor": {
+                                        "red": 1,
+                                        "green": 0.8,
+                                        "blue": 0.8,
+                                    }
+                                },
+                            },
+                        },
+                        "index": 1,
+                    }
+                },
+            ]
+        }
+
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID, body=body
+        ).execute()
+        print("✅ Conditional formatting applied successfully")
+
+    except Exception as e:
+        print(f"⚠️ Error applying conditional formatting: {e}")
+
+
+# --- Webhook ---
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
         if request.args.get("hub.verify_token") == VERIFY_TOKEN:
             return request.args.get("hub.challenge")
-        return "Invalid verification token", 403
-
-    data = request.get_json()
-    if "entry" in data:
-        for entry in data["entry"]:
-            for change in entry.get("changes", []):
-                value = change.get("value", {})
-                messages = value.get("messages", [])
-                if messages:
-                    msg = messages[0]
-                    user_id = msg["from"]
-                    text = msg.get("text", {}).get("body", "").strip()
-                    button_reply = msg.get("interactive", {}).get("button_reply", {}).get("id")
-
-                    # New user greeting
-                    if user_id not in user_states:
-                        if text.lower() in ["hi", "hello","hy","good morning","good evening","gm"]:
-                            send_whatsapp_message(
-                                user_id,
-                                "Hi, I am Kalagato AI Agent. Are you interested in selling your app?",
-                                ["Yes", "No"]
-                            )
-                            # step=-1 means waiting for listing selection
-                            user_states[user_id] = {"step": -1, "responses": [], "questions": []}
-                        continue
-
-                    state = user_states[user_id]
-                    step = state["step"]
-
-                    # Handle No
-                    if button_reply == "no":
-                        send_whatsapp_message(user_id, "Thanks, if you have any queries contact us on aman@kalagato.co")
-                        del user_states[user_id]
-                        continue
-
-                    # Handle Yes (from initial greeting)
-                    if button_reply == "yes" and step == -1:
-                        send_whatsapp_message(
-                            user_id,
-                            "Is your app listed on App Store, Play Store, or Both?",
-                            ["App Store", "Play Store", "Both"]
-                        )
-                        continue
-
-                    # Listing selection
-                    if step == -1:
-                        listing_answer = button_reply or text
-                        state["responses"].append(listing_answer.lower())
-                        state["questions"] = get_questions_for_user(listing_answer.lower())
-                        state["step"] = 0  # start actual questions
-                        send_whatsapp_message(user_id, state["questions"][0])
-                        continue
-
-                    # Validate
-                    valid, error_msg = validate_answer(step, text, state)
-                    if not valid:
-                        send_whatsapp_message(user_id, error_msg)
-                        continue
-
-                    # Save response and increment step
-                    state["responses"].append(text)
-                    state["step"] += 1
-
-                    if state["step"] < len(state["questions"]):
-                        send_whatsapp_message(user_id, state["questions"][state["step"]])
-                    else:
-                        save_to_sheet(user_id, state)
-                        send_whatsapp_message(user_id, "✅ Thank you! Your responses have been saved in our database we will contact you ASAP")
-                        del user_states[user_id]
-
+        return "Invalid verification token"
     return "OK", 200
 
+
+# --- Main ---
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    apply_conditional_formatting()  # Run once at startup
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
