@@ -32,7 +32,6 @@ HEADERS = {
 user_states = {}
 
 questions = [
-    "Is your app listed on App Store, Play Store, or Both?",
     "Please provide the App Store link (if applicable).",
     "Please provide the Play Store link (if applicable).",
     "What is your last 12 months revenue? (Numbers only)",
@@ -68,16 +67,16 @@ def send_whatsapp_message(to, text, buttons=None):
 
 def validate_answer(step, text):
     """Validate user responses by step index"""
-    if step == 1 and not text.lower() in ["app store", "play store", "both"]:
-        return False, "❌ Please reply with 'App Store', 'Play Store', or 'Both'."
+    if step == 0:
+        return True, None  # listing is handled by button
 
-    if step == 2 and not text.startswith("https://apps.apple.com"):
+    if step == 1 and text and not text.startswith("https://apps.apple.com"):
         return False, "❌ Invalid App Store link. Please provide a valid URL."
 
-    if step == 3 and not text.startswith("https://play.google.com"):
+    if step == 2 and text and not text.startswith("https://play.google.com"):
         return False, "❌ Invalid Play Store link. Please provide a valid URL."
 
-    if step in [4, 5, 6, 7, 8] and not text.replace(".", "").isdigit():
+    if step in [3,4,5,6,7] and not text.replace(".", "").isdigit():
         return False, "❌ Please enter a valid number."
 
     return True, None
@@ -89,7 +88,7 @@ def save_to_sheet(user_id, responses):
 
     # Highlight monthly profit cell if >= 7000
     try:
-        monthly_profit = float(responses[6])  # index 6 = Monthly Profit
+        monthly_profit = float(responses[5])  # index 5 = Monthly Profit
         row_number = len(sheet.get_all_values())  # new row index
         if monthly_profit >= 7000:
             sheet.format(f"I{row_number}", {"backgroundColor": {"red": 0.6, "green": 0.9, "blue": 0.6}})
@@ -118,6 +117,7 @@ def webhook():
 
                     if user_id not in user_states:
                         if text.lower() in ["hi", "hello"]:
+                            # Send first interactive buttons for "Yes" / "No"
                             send_whatsapp_message(
                                 user_id,
                                 "Hi, I am Kalagato AI Agent. Are you interested in selling your app?",
@@ -137,8 +137,29 @@ def webhook():
 
                     # Handle "Yes"
                     if button_reply == "yes" and step == 0:
-                        state["step"] = 1
-                        send_whatsapp_message(user_id, questions[0])
+                        state["step"] = 0
+                        # Send listing question as interactive buttons
+                        send_whatsapp_message(
+                            user_id,
+                            "Is your app listed on App Store, Play Store, or Both?",
+                            ["App Store", "Play Store", "Both"]
+                        )
+                        continue
+
+                    # Collect listing answer from button reply
+                    if step == 0:
+                        listing_answer = button_reply or text
+                        state["responses"].append(listing_answer)
+                        # Decide next question based on listing
+                        if listing_answer.lower() == "app store":
+                            state["step"] = 1
+                            send_whatsapp_message(user_id, questions[0])
+                        elif listing_answer.lower() == "play store":
+                            state["step"] = 2
+                            send_whatsapp_message(user_id, questions[1])
+                        elif listing_answer.lower() == "both":
+                            state["step"] = 1
+                            send_whatsapp_message(user_id, questions[0])
                         continue
 
                     # Validate responses
@@ -149,22 +170,6 @@ def webhook():
 
                     # Save valid response
                     state["responses"].append(text)
-
-                    # Conditional skipping for listing type
-                    if step == 1:
-                        listing = text.lower()
-                        if listing == "app store":
-                            state["step"] = 2
-                            send_whatsapp_message(user_id, questions[1])
-                            continue
-                        elif listing == "play store":
-                            state["step"] = 3
-                            send_whatsapp_message(user_id, questions[2])
-                            continue
-                        elif listing == "both":
-                            state["step"] = 2
-                            send_whatsapp_message(user_id, questions[1])
-                            continue
 
                     # Move to next question
                     state["step"] += 1
