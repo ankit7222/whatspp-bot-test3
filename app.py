@@ -1,84 +1,191 @@
 import os
 import json
-import re
+from flask import Flask, request
+import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from flask import Flask, request, jsonify
+from datetime import datetime
 
 app = Flask(__name__)
 
-GOOGLE_SHEETS_CREDENTIALS = '{"type":"service_account","project_id":"developer-lists","private_key_id":"66363c6d2c2effb8269dcab29ae6d9cbc8f05226","private_key":"-----BEGIN PRIVATE KEY-----\\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCdpxhaaCiUpFQT\\nWe9lY1nQ3X7LY3mBFjPZ67qVZaHXFdKLe3pO7a45ttBJX5k1deZuKE9fBZs4tokm\\nprYXBB3q3CJFCttb8L3o/qixRBko5OcAkM0Mffv4Dq+I3QZQFVPfVSGSS+m/FDXI\\nxXuaLLX3v8B6qs+XufRmPbx5uhfDowfcCT3Mlzu8X0Wqs+QJV0R81N5WLeYbY9xU\\ncDyR/1TlqL0Ad8AWrxETHOIoKIJj+ae+P+8LzoZxxtrAIsYmWtLUQl5OWrNeCmLV\\nHKA1LiFZJjsqLP3zzDNvUOH8joYMhoJqqkW2uq0P4ZEVoBNwX9McfemTOXulnSLK\\nkyuv0eH7AgMBAAECggEAAwGUucz3HGeV9TLe3xN4gL6WUYFa8133yfc75bkfLJgY\\n+qV1hzA4nH/xPF5lcC9llGtX5wWLZDnGeLydtlwBgpViSbliOp1yuCgpKQznPV7M\\nCE+XotJ7RQXGqqdlYmAApXjLVDk8n8ReTIwCBlHRHwRUFCK63xpKmkLbvrKnxc5B\\n98OMrYuCEIM1TnSv+muVeiqZXl0E2E0LLRgNulqAmI2XA4HIThP4rCRJlA4hlpGy\\nCF5KpjuMVMSW47kZ6X15a+0AWfgx7vpu1XjU1aeyQSJ26FaZgr5UIbbAk3Uniast\\nhP8GybDi4HpsSchKRRern5Yowoq4VSFYzRDzxlDZTQKBgQDM5Xj8WhyFhlJTmU1h\\nBnONOe8iX6SQ1PC67Qa9cBE2FrtKGVuZq0qCkaIexESmclIrtWrr3WQAYcXTbX8W\\n3cLu6rLiiLSMN/01j0d38a0/mSuEqiSOz2f4YX7dcQ2nZEEa//Aq65Q93aUsVQV0\\nUPaQ87g1ASZVu75mMT6e1SZydwKBgQDE+SOj2/ozUzRqrHTFlbWPs5ZzA/MKa4XZ\\n6QlTu3KWE6eUoK693v5sfur1YOB1g5vyBCpxA6xcfL2squeViYugZZO1wE3Vv+UV\\nOz+4Uvak0CeyfXPC1BXMQexUE+NBbqnazl5pkg3IR2BuIiwL7Fmbs5Xk/t1c5oS3\\n4JEinuSJnQKBgERRj1G1SiVLcE/noeFkIUtJse6oLVsNZWcueTzZDSQX2EMQyXYn\\noyR+IqxXjPxiyftA9nHG0/08nJWuwN2C++hl4VefdXP7hzZAm/fmYXn/PH9zq9Ti\\nWyx6da6ob4EM8JhsFkx5WGh4awapIrRx+oTCfv1NcNbNTuMMMHENaVBpAoGBAIW0\\n9Qt6/JkwhulOjam+GVQlvR/v82AEYwTr2of7OypCx0Pt2xBKOfzeHpJYo6VBpG8h\\ngsnai3rwtjRqgu+QQbasnRsIIg3RyCikYnm133U7U2cnH5iGLRHNQiZEpcQ54ZUE\\n9zPEkBR+1yeLjMi/NIir3DlpBEzWsgq7pumQYGRFAoGBAII2YHq7pDsi4sO3gtO6\\nF3xm41iczXh8LVhn5jO1L8e2Ek3oqF760sHmsDik+ga54K6KXBEh2A1WuHW9lUxB\\nJtEaLb5CqkKfKmLF9UyF5+vUp1tS0w9jlv/DZmv/GsUAKumUh8XOKvXMrJ0/DysW\\new7NjVNuuHs34JdssuU09XBu\\n-----END PRIVATE KEY-----\\n","client_email":"whatapp-bot@developer-lists.iam.gserviceaccount.com","client_id":"107692818249201705280","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs","client_x509_cert_url":"https://www.googleapis.com/robot/v1/metadata/x509/whatapp-bot%40developer-lists.iam.gserviceaccount.com","universe_domain":"googleapis.com"}'
+# ===================== GOOGLE SHEETS SETUP =====================
+SHEET_NAME = os.getenv("Whatsapp_bot_AK")
 
-creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS)
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-client = gspread.authorize(credentials)
+creds_json = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
+client = gspread.authorize(creds)
+sheet = client.open(SHEET_NAME).sheet1
 
-SHEET_ID = "1V9c_MpFj3ttW6Yeu2WE8FsLuSgRhO1B87sHhxJswIlk"
-sheet = client.open_by_key(SHEET_ID).sheet1
+# ===================== WHATSAPP API SETUP =====================
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 
-def is_number(value):
+WHATSAPP_API_URL = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
+HEADERS = {
+    "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+    "Content-Type": "application/json"
+}
+
+# ===================== CONVERSATION STATE =====================
+user_states = {}
+
+# ===================== HELPER FUNCTIONS =====================
+def send_whatsapp_message(to, text, buttons=None):
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive" if buttons else "text"
+    }
+    if buttons:
+        data["interactive"] = {
+            "type": "button",
+            "body": {"text": text},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": b.lower(), "title": b}}
+                    for b in buttons
+                ]
+            }
+        }
+    else:
+        data["text"] = {"body": text}
+
+    requests.post(WHATSAPP_API_URL, headers=HEADERS, json=data)
+
+def get_questions_for_user(listing):
+    q = []
+    if listing in ["app store", "both"]:
+        q.append("Please provide the App Store link (if applicable).")
+    if listing in ["play store", "both"]:
+        q.append("Please provide the Play Store link (if applicable).")
+    q += [
+        "What is your last 12 months revenue? (Numbers only)",
+        "What is your last 12 months profit? (Numbers only)",
+        "What is your last 12 months spends? (Numbers only)",
+        "What is your monthly profit? (Numbers only)",
+        "What is your Daily Active Users (DAU)? (Numbers only)",
+        "What is your Monthly Active Users (MAU)? (Numbers only)"
+    ]
+    return q
+
+def validate_answer(step, text, user_state):
+    current_question = user_state["questions"][step]
+    if "app store link" in current_question.lower():
+        if not text.startswith("https://apps.apple.com"):
+            return False, "❌ Invalid App Store link. Please provide a valid URL."
+    if "play store link" in current_question.lower():
+        if not text.startswith("https://play.google.com"):
+            return False, "❌ Invalid Play Store link. Please provide a valid URL."
+    if any(x in current_question.lower() for x in ["revenue", "profit", "spends", "dau", "mau"]):
+        if not text.replace(".", "").isdigit():
+            return False, "❌ Please enter a valid number."
+    return True, None
+
+def save_to_sheet(user_id, state):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    listing = state["responses"][0].lower()
+    app_store_link = ""
+    play_store_link = ""
+    numeric_responses = []
+
+    for q, resp in zip(state["questions"], state["responses"][1:]):
+        if "app store link" in q.lower():
+            app_store_link = resp
+        elif "play store link" in q.lower():
+            play_store_link = resp
+        else:
+            numeric_responses.append(resp)
+
+    row = [now, user_id, listing, app_store_link, play_store_link] + numeric_responses
+    sheet.append_row(row)
+
     try:
-        float(value)
-        return True
+        monthly_profit = float(row[8])
+        row_number = len(sheet.get_all_values())
+        if monthly_profit >= 7000:
+            sheet.format(f"I{row_number}", {"backgroundColor": {"red": 0.6, "green": 0.9, "blue": 0.6}})
     except:
-        return False
+        pass
 
-def is_valid_playstore_link(link):
-    return bool(re.match(r'https://play\.google\.com/store/apps/details\?id=.*', link))
+# ===================== WEBHOOK ENDPOINT =====================
+@app.route("/webhook", methods=["GET", "POST"])
+def webhook():
+    if request.method == "GET":
+        if request.args.get("hub.verify_token") == VERIFY_TOKEN:
+            return request.args.get("hub.challenge")
+        return "Invalid verification token", 403
 
-def is_valid_appstore_link(link):
-    return bool(re.match(r'https://apps\.apple\.com/.*', link))
+    data = request.get_json()
+    if "entry" in data:
+        for entry in data["entry"]:
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                messages = value.get("messages", [])
+                if messages:
+                    msg = messages[0]
+                    user_id = msg["from"]
+                    text = msg.get("text", {}).get("body", "").strip()
+                    button_reply = msg.get("interactive", {}).get("button_reply", {}).get("id")
 
-@app.route('/add_data', methods=['POST'])
-def add_data():
-    data = request.json
+                    # New user greeting
+                    if user_id not in user_states:
+                        if text.lower() in ["hi", "hello"]:
+                            send_whatsapp_message(
+                                user_id,
+                                "Hi, I am Kalagato AI Agent. Are you interested in selling your app?",
+                                ["Yes", "No"]
+                            )
+                            # step=-1 means waiting for listing selection
+                            user_states[user_id] = {"step": -1, "responses": [], "questions": []}
+                        continue
 
-    app_listing = data.get("app_listing", "")
-    app_link_playstore = data.get("app_link_playstore", "")
-    app_link_appstore = data.get("app_link_appstore", "")
-    last_12_month_revenue = data.get("last_12_month_revenue", "")
-    last_12_month_profit = data.get("last_12_month_profit", "")
-    last_12_month_spend = data.get("last_12_month_spend", "")
-    monthly_profit_avg = data.get("monthly_profit_avg", "")
-    options = data.get("options", [])
+                    state = user_states[user_id]
+                    step = state["step"]
 
-    # Validate numeric fields
-    for field in [last_12_month_revenue, last_12_month_profit, last_12_month_spend, monthly_profit_avg]:
-        if field and not is_number(field):
-            return jsonify({"status": "error", "message": "Numeric values required for revenue, profit, spend, monthly avg"}), 400
+                    # Handle No
+                    if button_reply == "no":
+                        send_whatsapp_message(user_id, "Thanks, if you have any queries contact us on aman@kalagato.co")
+                        del user_states[user_id]
+                        continue
 
-    # Validate links
-    if app_listing in ["Play Store", "Both"] and not is_valid_playstore_link(app_link_playstore):
-        return jsonify({"status": "error", "message": "Invalid Play Store link"}), 400
-    if app_listing in ["App Store", "Both"] and not is_valid_appstore_link(app_link_appstore):
-        return jsonify({"status": "error", "message": "Invalid App Store link"}), 400
+                    # Handle Yes (from initial greeting)
+                    if button_reply == "yes" and step == -1:
+                        send_whatsapp_message(
+                            user_id,
+                            "Is your app listed on App Store, Play Store, or Both?",
+                            ["App Store", "Play Store", "Both"]
+                        )
+                        continue
 
-    # Revenue source yes/no
-    iap_revenue = "Yes" if "IAP Revenue" in options else "No"
-    subscription_revenue = "Yes" if "Subscription Revenue" in options else "No"
-    ad_revenue = "Yes" if "Ad Revenue" in options else "No"
+                    # Listing selection
+                    if step == -1:
+                        listing_answer = button_reply or text
+                        state["responses"].append(listing_answer.lower())
+                        state["questions"] = get_questions_for_user(listing_answer.lower())
+                        state["step"] = 0  # start actual questions
+                        send_whatsapp_message(user_id, state["questions"][0])
+                        continue
 
-    # Skip non-selected store links
-    if app_listing == "App Store":
-        app_link_playstore = ""
-    elif app_listing == "Play Store":
-        app_link_appstore = ""
+                    # Validate
+                    valid, error_msg = validate_answer(step, text, state)
+                    if not valid:
+                        send_whatsapp_message(user_id, error_msg)
+                        continue
 
-    sheet.append_row([
-        app_listing,
-        app_link_playstore,
-        app_link_appstore,
-        last_12_month_revenue,
-        last_12_month_profit,
-        last_12_month_spend,
-        monthly_profit_avg,
-        iap_revenue,
-        subscription_revenue,
-        ad_revenue
-    ])
+                    # Save response and increment step
+                    state["responses"].append(text)
+                    state["step"] += 1
 
-    return jsonify({"status": "success", "message": "Data added successfully"})
+                    if state["step"] < len(state["questions"]):
+                        send_whatsapp_message(user_id, state["questions"][state["step"]])
+                    else:
+                        save_to_sheet(user_id, state)
+                        send_whatsapp_message(user_id, "✅ Thank you! Your responses have been saved.")
+                        del user_states[user_id]
 
-if __name__ == '__main__':
-    app.run(debug=True)
+    return "OK", 200
+
+if __name__ == "__main__":
+    app.run(port=5000, debug=True)
