@@ -9,7 +9,7 @@ from datetime import datetime
 app = Flask(__name__)
 
 # ===================== GOOGLE SHEETS SETUP =====================
-SHEET_NAME = os.getenv("Whatsapp_bot_AK")
+SHEET_NAME = os.getenv("SHEET_NAME")
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds_json = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
@@ -71,36 +71,48 @@ def get_questions_for_user(listing):
     return q
 
 def validate_answer(step, text, user_state):
+    listing = user_state["responses"][0].lower() if user_state["responses"] else ""
     current_question = user_state["questions"][step]
+
+    # Validate links
     if "app store link" in current_question.lower():
         if not text.startswith("https://apps.apple.com"):
             return False, "❌ Invalid App Store link. Please provide a valid URL."
     if "play store link" in current_question.lower():
         if not text.startswith("https://play.google.com"):
             return False, "❌ Invalid Play Store link. Please provide a valid URL."
+
+    # Validate numeric
     if any(x in current_question.lower() for x in ["revenue", "profit", "spends", "dau", "mau"]):
         if not text.replace(".", "").isdigit():
             return False, "❌ Please enter a valid number."
+
     return True, None
 
 def save_to_sheet(user_id, state):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     listing = state["responses"][0].lower()
+    index = 1
     app_store_link = ""
     play_store_link = ""
-    numeric_responses = []
 
-    for q, resp in zip(state["questions"], state["responses"][1:]):
-        if "app store link" in q.lower():
-            app_store_link = resp
-        elif "play store link" in q.lower():
-            play_store_link = resp
-        else:
-            numeric_responses.append(resp)
+    if listing == "app store":
+        app_store_link = state["responses"][index]
+        index += 1
+    elif listing == "play store":
+        play_store_link = state["responses"][index]
+        index += 1
+    elif listing == "both":
+        app_store_link = state["responses"][index]
+        index += 1
+        play_store_link = state["responses"][index]
+        index += 1
 
-    row = [now, user_id, listing, app_store_link, play_store_link] + numeric_responses
+    remaining = state["responses"][index:]
+    row = [now, user_id, listing, app_store_link, play_store_link] + remaining
     sheet.append_row(row)
 
+    # Highlight monthly profit if >=7000
     try:
         monthly_profit = float(row[8])
         row_number = len(sheet.get_all_values())
@@ -129,7 +141,6 @@ def webhook():
                     text = msg.get("text", {}).get("body", "").strip()
                     button_reply = msg.get("interactive", {}).get("button_reply", {}).get("id")
 
-                    # New user greeting
                     if user_id not in user_states:
                         if text.lower() in ["hi", "hello"]:
                             send_whatsapp_message(
@@ -137,8 +148,7 @@ def webhook():
                                 "Hi, I am Kalagato AI Agent. Are you interested in selling your app?",
                                 ["Yes", "No"]
                             )
-                            # step=-1 means waiting for listing selection
-                            user_states[user_id] = {"step": -1, "responses": [], "questions": []}
+                            user_states[user_id] = {"step": 0, "responses": []}
                         continue
 
                     state = user_states[user_id]
@@ -150,8 +160,8 @@ def webhook():
                         del user_states[user_id]
                         continue
 
-                    # Handle Yes (from initial greeting)
-                    if button_reply == "yes" and step == -1:
+                    # Handle Yes
+                    if button_reply == "yes" and step == 0:
                         send_whatsapp_message(
                             user_id,
                             "Is your app listed on App Store, Play Store, or Both?",
@@ -160,11 +170,11 @@ def webhook():
                         continue
 
                     # Listing selection
-                    if step == -1:
+                    if step == 0:
                         listing_answer = button_reply or text
                         state["responses"].append(listing_answer.lower())
                         state["questions"] = get_questions_for_user(listing_answer.lower())
-                        state["step"] = 0  # start actual questions
+                        state["step"] = 0
                         send_whatsapp_message(user_id, state["questions"][0])
                         continue
 
@@ -174,7 +184,7 @@ def webhook():
                         send_whatsapp_message(user_id, error_msg)
                         continue
 
-                    # Save response and increment step
+                    # Save response
                     state["responses"].append(text)
                     state["step"] += 1
 
