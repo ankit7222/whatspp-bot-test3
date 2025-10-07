@@ -1,4 +1,4 @@
-# app.py
+# app.py (lazy-safe startup; use on Render to avoid port-scan timeouts)
 import os
 import json
 import re
@@ -7,7 +7,7 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, request
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import WorksheetNotFound
@@ -21,14 +21,14 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "verify_token")
 
-GOOGLE_SHEETS_CREDENTIALS = os.getenv("GOOGLE_SHEETS_CREDENTIALS")  # single-line JSON OR leave empty to use service_account.json file
+GOOGLE_SHEETS_CREDENTIALS = os.getenv("GOOGLE_SHEETS_CREDENTIALS")  # single-line JSON or blank for file
 SHEET_ID = os.getenv("SHEET_ID")
 SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
 
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASS = os.getenv("GMAIL_APP_PASS")
 
-VALUATION_CC = os.getenv("VALUATION_CC", "")  # optional comma-separated CCs
+VALUATION_CC = os.getenv("VALUATION_CC", "")
 
 GREETING_TEXT = os.getenv("GREETING_TEXT", "Hi, I am Kalagato AI Agent. Would you like a free app valuation?")
 NO_RESPONSE_TEXT = os.getenv("NO_RESPONSE_TEXT", "Thanks — if you have any queries contact us on aman@kalagato.co")
@@ -39,70 +39,96 @@ WHATSAPP_API_URL = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages
 WHATSAPP_HEADERS = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
 
 # ---------------------------
-# Basic checks
+# WARN if required envs missing (but DO NOT crash)
 # ---------------------------
 if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-    app.logger.warning("WHATSAPP_TOKEN or PHONE_NUMBER_ID not set. Bot won't be able to send WhatsApp messages.")
+    app.logger.warning("WHATSAPP_TOKEN or PHONE_NUMBER_ID not set. WhatsApp sending will be disabled until configured.")
 
 if not SHEET_ID:
-    raise RuntimeError("SHEET_ID environment variable is required and not set.")
+    app.logger.warning("SHEET_ID not set. Google Sheets writes will be disabled until configured.")
 
 # ---------------------------
-# Google Sheets auth + worksheet creation if missing
+# Google Sheets lazy init (safe)
 # ---------------------------
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+_gs_client = None
+_worksheet = None
+_gs_init_error = None
 
-def get_worksheet():
-    """Authorize and return the worksheet. Create tab if missing."""
+def try_init_gs():
+    """Attempt to authorize gspread and open/create worksheet.
+       If anything fails, store error and return None — do not raise.
+    """
+    global _gs_client, _worksheet, _gs_init_error
+    if _worksheet is not None:
+        return _worksheet
     try:
+        if not SHEET_ID:
+            _gs_init_error = "SHEET_ID not configured"
+            app.logger.warning("Google Sheets init skipped: %s", _gs_init_error)
+            return None
+
         if GOOGLE_SHEETS_CREDENTIALS:
-            creds_info = json.loads(GOOGLE_SHEETS_CREDENTIALS)
-            creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+            try:
+                creds_info = json.loads(GOOGLE_SHEETS_CREDENTIALS)
+                creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+            except Exception as e:
+                _gs_init_error = f"Failed parsing GOOGLE_SHEETS_CREDENTIALS JSON: {e}"
+                app.logger.error(_gs_init_error)
+                return None
         else:
-            creds = Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
+            # try local file (for dev) — if missing, set error and continue
+            try:
+                creds = Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
+            except Exception as e:
+                _gs_init_error = f"service_account.json not found or invalid: {e}"
+                app.logger.error(_gs_init_error)
+                return None
+
+        _gs_client = gspread.authorize(creds)
+        try:
+            spreadsheet = _gs_client.open_by_key(SHEET_ID)
+        except Exception as e:
+            _gs_init_error = f"Cannot open spreadsheet (SHEET_ID): {e}"
+            app.logger.error(_gs_init_error)
+            return None
+
+        try:
+            _worksheet = spreadsheet.worksheet(SHEET_NAME)
+        except WorksheetNotFound:
+            app.logger.info("Worksheet '%s' not found — creating new worksheet.", SHEET_NAME)
+            try:
+                _worksheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows="1000", cols="20")
+                headers = [
+                    "Timestamp", "User ID", "Name", "App Link",
+                    "Annual Revenue", "Marketing Cost", "Server Cost", "Annual Profit",
+                    "Revenue Type", "Email", "Phone",
+                    "Estimated Valuation Min", "Estimated Valuation Max", "Estimated Valuation Mid", "CCs"
+                ]
+                _worksheet.insert_row(headers, index=1)
+                app.logger.info("Worksheet created and headers inserted.")
+            except Exception as e:
+                _gs_init_error = f"Failed to create worksheet: {e}"
+                app.logger.error(_gs_init_error)
+                _worksheet = None
+                return None
+        except Exception as e:
+            _gs_init_error = f"Failed accessing worksheet: {e}"
+            app.logger.error(_gs_init_error)
+            _worksheet = None
+            return None
+
+        app.logger.info("Google Sheets initialized successfully (worksheet: %s).", SHEET_NAME)
+        _gs_init_error = None
+        return _worksheet
+
     except Exception as e:
-        app.logger.error("Failed to load Google credentials: %s", e)
-        raise
-
-    client = gspread.authorize(creds)
-
-    try:
-        spreadsheet = client.open_by_key(SHEET_ID)
-    except Exception as e:
-        app.logger.error("Cannot open spreadsheet with id %s: %s", SHEET_ID, e)
-        raise
-
-    # Try to open worksheet; if not found, create it
-    try:
-        worksheet = spreadsheet.worksheet(SHEET_NAME)
-    except WorksheetNotFound:
-        app.logger.info("Worksheet '%s' not found — creating it.", SHEET_NAME)
-        # create worksheet with default rows/cols
-        worksheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows="1000", cols="20")
-        # set headers
-        headers = [
-            "Timestamp", "User ID", "Name", "App Link",
-            "Annual Revenue", "Marketing Cost", "Server Cost", "Annual Profit",
-            "Revenue Type", "Email", "Phone",
-            "Estimated Valuation Min", "Estimated Valuation Max", "Estimated Valuation Mid", "CCs"
-        ]
-        worksheet.insert_row(headers, index=1)
-    except Exception as e:
-        app.logger.error("Error accessing worksheet: %s", e)
-        raise
-
-    return worksheet
-
-# lazily initialize worksheet (so app starts quickly)
-worksheet = None
-def ensure_worksheet():
-    global worksheet
-    if worksheet is None:
-        worksheet = get_worksheet()
-    return worksheet
+        _gs_init_error = f"Unexpected error during Google Sheets init: {e}"
+        app.logger.error(_gs_init_error)
+        return None
 
 # ---------------------------
-# Conversation state (in-memory)
+# Flow config + helpers
 # ---------------------------
 user_states = {}
 QUESTION_FLOW = [
@@ -118,43 +144,29 @@ QUESTION_FLOW = [
     {"key": "cc_emails", "text": "Optional: reply with comma-separated emails to CC (or 'skip')", "type": "cc", "required": False}
 ]
 
-# ---------------------------
-# WhatsApp helpers
-# ---------------------------
 def send_whatsapp_text(to, text):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        app.logger.debug("Skipping WhatsApp send (missing token/phone id): %s", text)
+        app.logger.debug("WhatsApp disabled — message suppressed: %s", text)
         return
     payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
     try:
         resp = requests.post(WHATSAPP_API_URL, headers=WHATSAPP_HEADERS, json=payload, timeout=10)
-        app.logger.debug("WhatsApp send status: %s %s", resp.status_code, resp.text[:200])
+        app.logger.debug("WhatsApp send status: %s %s", resp.status_code, (resp.text or "")[:200])
     except Exception as e:
-        app.logger.error("WhatsApp send exception: %s", e)
+        app.logger.error("WhatsApp send error: %s", e)
 
 def send_whatsapp_buttons(to, text, buttons):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        app.logger.debug("Skipping WhatsApp interactive send (missing token/phone id): %s", text)
+        app.logger.debug("WhatsApp buttons suppressed: %s", text)
         return
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "interactive",
-        "interactive": {
-            "type": "button",
-            "body": {"text": text},
-            "action": {"buttons": [{"type": "reply", "reply": {"id": b.lower().replace(" ", "_"), "title": b}} for b in buttons]}
-        }
-    }
+    payload = {"messaging_product":"whatsapp","to":to,"type":"interactive","interactive":{"type":"button","body":{"text":text},"action":{"buttons":[{"type":"reply","reply":{"id":b.lower().replace(' ','_'),"title":b}} for b in buttons]}}}
     try:
         resp = requests.post(WHATSAPP_API_URL, headers=WHATSAPP_HEADERS, json=payload, timeout=10)
-        app.logger.debug("WhatsApp buttons status: %s %s", resp.status_code, resp.text[:200])
+        app.logger.debug("WhatsApp interactive status: %s %s", resp.status_code, (resp.text or "")[:200])
     except Exception as e:
-        app.logger.error("WhatsApp send exception: %s", e)
+        app.logger.error("WhatsApp send error: %s", e)
 
-# ---------------------------
-# Validation helpers
-# ---------------------------
+# validators
 def is_number(val):
     try:
         float(str(val))
@@ -185,9 +197,7 @@ def parse_user_ccs(raw):
             seen.append(x)
     return seen[:3]
 
-# ---------------------------
-# Valuation logic
-# ---------------------------
+# compute valuation
 def compute_valuation(profit_value, revenue_type):
     try:
         profit_num = float(profit_value) if profit_value not in (None, "") else 0.0
@@ -212,12 +222,10 @@ def compute_valuation(profit_value, revenue_type):
 
     return valuation_min, valuation_max, estimated
 
-# ---------------------------
-# Email with CC support
-# ---------------------------
+# email send (env-driven CC)
 def send_valuation_email(to_email, to_name, plain_text, full_html, cc_list=None):
     if not GMAIL_USER or not GMAIL_APP_PASS:
-        app.logger.warning("Gmail credentials not set; skipping email send.")
+        app.logger.warning("Gmail not configured; skipping email.")
         return False
 
     env_cc_list = [e.strip() for e in (VALUATION_CC or "").split(",") if e.strip()]
@@ -254,14 +262,11 @@ def send_valuation_email(to_email, to_name, plain_text, full_html, cc_list=None)
         app.logger.error("Email send failed: %s", e)
         return False
 
-# ---------------------------
-# Save to Google Sheet
-# ---------------------------
+# save to sheet (safe if sheet not available)
 def save_to_sheet(user_id, answers, valuation_min, valuation_max, estimated, cc_list):
-    try:
-        ws = ensure_worksheet()
-    except Exception as e:
-        app.logger.error("Cannot access worksheet: %s", e)
+    ws = try_init_gs()
+    if ws is None:
+        app.logger.warning("Skipping sheet save: Google Sheets not initialized (error: %s)", _gs_init_error)
         return
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     row = [
@@ -286,16 +291,12 @@ def save_to_sheet(user_id, answers, valuation_min, valuation_max, estimated, cc_
     except Exception as e:
         app.logger.error("Failed to append to sheet: %s", e)
 
-# ---------------------------
-# Health route
-# ---------------------------
+# health route
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
 
-# ---------------------------
-# Webhook route
-# ---------------------------
+# webhook route
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
@@ -420,13 +421,14 @@ def webhook():
     return "OK", 200
 
 # ---------------------------
-# Run
+# START (safe)
 # ---------------------------
 if __name__ == "__main__":
-    # Ensure worksheet is created at startup to catch credential errors early
+    # try to initialize sheets but do NOT exit on failure
     try:
-        ensure_worksheet()
+        try_init_gs()
     except Exception as e:
-        app.logger.error("Worksheet initialization error: %s", e)
+        app.logger.warning("Ignored error during initial Google Sheets init: %s", e)
 
+    # run flask app for debug; in Render use Procfile / gunicorn
     app.run(host="0.0.0.0", port=PORT)
