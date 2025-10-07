@@ -1,466 +1,551 @@
+# app.py
 import os
 import json
 import re
-import requests
-import smtplib
-from email.message import EmailMessage
+import logging
 from datetime import datetime
-from flask import Flask, request
+from flask import Flask, request, jsonify
+import requests
 import gspread
-from urllib.parse import urlparse
+from oauth2client.service_account import ServiceAccountCredentials
 
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("whatsapp-bot")
+
+# ---------- Flask ----------
 app = Flask(__name__)
 
-# ---------- Config from env ----------
-PORT = int(os.getenv("PORT") or 5000)
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
-SHEET_NAME = os.getenv("SHEET_NAME", "")
-SHEET_TAB = os.getenv("SHEET_TAB", None)  # optional, uses first sheet by default
+# ---------- Environment / Config ----------
+SHEET_NAME = os.getenv("SHEET_NAME")
+GOOGLE_SHEETS_CREDENTIALS = os.getenv("GOOGLE_SHEETS_CREDENTIALS")  # full JSON
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "verify_token")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_FUNCTION_NAME = os.getenv("SUPABASE_FUNCTION_NAME", "send-valuation")
+EMAIL_CCS = os.getenv("EMAIL_CCS", "")  # comma-separated CC emails to pass to supabase function (if function supports it)
 
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-CC_EMAILS = [e.strip() for e in (os.getenv("CC_EMAILS", "") or "").split(",") if e.strip()]
-SUPABASE_FUNCTION_URL = os.getenv("SUPABASE_FUNCTION_URL", "")  # optional; will be called after saving
+if not all([SHEET_NAME, GOOGLE_SHEETS_CREDENTIALS, PHONE_NUMBER_ID, WHATSAPP_TOKEN]):
+    logger.warning("One or more core environment variables are missing. Make sure SHEET_NAME, GOOGLE_SHEETS_CREDENTIALS, PHONE_NUMBER_ID and WHATSAPP_TOKEN are set.")
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# ---------- Google Sheets Setup ----------
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
+# GOOGLE_SHEETS_CREDENTIALS expected to be full JSON string (multiline JSON allowed)
+try:
+    creds_json = json.loads(GOOGLE_SHEETS_CREDENTIALS) if GOOGLE_SHEETS_CREDENTIALS else None
+    if creds_json:
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
+        gclient = gspread.authorize(creds)
+        sheet = gclient.open(SHEET_NAME).sheet1
+        logger.info("Google Sheets client initialized and sheet opened.")
+    else:
+        sheet = None
+        logger.warning("No Google Sheets credentials found; sheet operations will be skipped.")
+except Exception as e:
+    sheet = None
+    logger.exception("Failed to initialize Google Sheets client: %s", e)
+
+# ---------- WhatsApp API Setup ----------
 WHATSAPP_API_URL = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
 HEADERS = {
     "Authorization": f"Bearer {WHATSAPP_TOKEN}",
     "Content-Type": "application/json"
 }
 
-# ---------- Google Sheets auth: either JSON string env or path ----------
-def get_gspread_client():
-    creds_json = None
-    cred_path = os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH")
-    cred_json_env = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON")
-
-    if cred_path and os.path.exists(cred_path):
-        with open(cred_path, "r", encoding="utf-8") as f:
-            creds_json = json.load(f)
-    elif cred_json_env:
-        # support multi-line JSON stored in env directly
-        try:
-            creds_json = json.loads(cred_json_env)
-        except Exception as exc:
-            # try to fix escaped newlines
-            fixed = cred_json_env.replace('\\n', '\n')
-            creds_json = json.loads(fixed)
-
-    if not creds_json:
-        app.logger.error("Google Sheets credentials not found. Set GOOGLE_SHEETS_CREDENTIALS_PATH or GOOGLE_SHEETS_CREDENTIALS_JSON")
-        return None
-
-    client = gspread.service_account_from_dict(creds_json)
-    return client
-
-gclient = get_gspread_client()
-sheet = None
-if gclient and SHEET_NAME:
-    try:
-        sh = gclient.open(SHEET_NAME)
-        sheet = sh.worksheet(SHEET_TAB) if SHEET_TAB else sh.sheet1
-    except Exception as e:
-        app.logger.error("Could not open sheet: %s", e)
-        sheet = None
-else:
-    app.logger.warning("Google Sheets client or sheet name not configured.")
-
 # ---------- Conversation state ----------
-# In-memory dictionary: { user_id: state_dict }
-# state_dict: {step: string/int, responses: dict}
+# In-memory state for demo. For production use Redis or DB to persist between processes.
 user_states = {}
 
-# ---------- Helper: sending WhatsApp messages ----------
-def send_whatsapp_message(to, text, buttons=None):
+# ---------- Helper functions ----------
+def send_whatsapp_text(to, text):
     data = {
         "messaging_product": "whatsapp",
         "to": to,
+        "type": "text",
+        "text": {"body": text}
     }
-    if buttons:
-        data.update({
-            "type": "interactive",
-            "interactive": {
-                "type": "button",
-                "body": {"text": text},
-                "action": {"buttons": [{"type": "reply", "reply": {"id": b['id'], "title": b['title']}} for b in buttons]}
-            }
-        })
-    else:
-        data.update({"type": "text", "text": {"body": text}})
     try:
-        requests.post(WHATSAPP_API_URL, headers=HEADERS, json=data, timeout=10)
+        resp = requests.post(WHATSAPP_API_URL, headers=HEADERS, json=data, timeout=10)
+        resp.raise_for_status()
+        logger.info("Sent text to %s", to)
+        return resp.json()
     except Exception as e:
-        app.logger.exception("Failed to send whatsapp message: %s", e)
+        logger.exception("Failed to send WhatsApp text: %s", e)
+        return None
 
-# ---------- Validation ----------
-def is_valid_url(url):
+def send_whatsapp_buttons(to, body_text, buttons):
+    """
+    buttons: list of strings (titles). Each reply id will be the lowercased title.
+    """
+    interactive = {
+        "type": "button",
+        "body": {"text": body_text},
+        "action": {
+            "buttons": [
+                {"type": "reply", "reply": {"id": b.lower(), "title": b}}
+                for b in buttons
+            ]
+        }
+    }
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": interactive
+    }
     try:
-        p = urlparse(url)
-        return p.scheme in ("http", "https") and p.netloc != ""
+        resp = requests.post(WHATSAPP_API_URL, headers=HEADERS, json=data, timeout=10)
+        resp.raise_for_status()
+        logger.info("Sent buttons to %s: %s", to, buttons)
+        return resp.json()
+    except Exception as e:
+        logger.exception("Failed to send WhatsApp buttons: %s", e)
+        return None
+
+def _is_number_text(text: str) -> bool:
+    if text is None:
+        return False
+    t = str(text).strip()
+    if t == "":
+        return False
+    # remove currency symbols and spaces but keep digits, dot, minus
+    cleaned = re.sub(r"[^\d\.\-]", "", t)
+    return bool(re.match(r"^-?\d+(\.\d+)?$", cleaned))
+
+def _parse_number(text: str) -> float:
+    if text is None:
+        return 0.0
+    t = str(text).strip()
+    cleaned = re.sub(r"[^\d\.\-]", "", t)
+    try:
+        return float(cleaned) if cleaned not in ("", "-", None) else 0.0
     except:
+        return 0.0
+
+def _parse_revenue_types(text: str):
+    """
+    Accepts '1,3' or 'iap,ad' or 'Ad,iap' or '1' etc.
+    Returns dict of flags {IAP: Yes/No, Subscription: Yes/No, Ad: Yes/No}
+    """
+    selected = set()
+    if not text:
+        return {"IAP": "No", "Subscription": "No", "Ad": "No"}
+    parts = [p.strip().lower() for p in re.split(r"[,\s]+", text) if p.strip()]
+    mapping = {"1": "IAP", "2": "Subscription", "3": "Ad"}
+    for p in parts:
+        if p in mapping:
+            selected.add(mapping[p])
+        else:
+            if "iap" in p:
+                selected.add("IAP")
+            if "sub" in p:
+                selected.add("Subscription")
+            if "ad" in p:
+                selected.add("Ad")
+    return {
+        "IAP": "Yes" if "IAP" in selected else "No",
+        "Subscription": "Yes" if "Subscription" in selected else "No",
+        "Ad": "Yes" if "Ad" in selected else "No",
+    }
+
+def compute_valuation(profit_num: float, revenue_types_text: str):
+    """
+    Uses same rules as your Supabase function:
+      - profit < 1000: fixed 1000
+      - Ad only: 1.0x - 1.7x
+      - Subscription / Others / IAP: 1.5x - 2.3x
+      - fallback: 2.5x single multiplier
+    Returns valuationMin, valuationMax, estimatedAvg, formattedString
+    """
+    rt = _parse_revenue_types(revenue_types_text)
+    if profit_num < 1000:
+        valuation_min = valuation_max = 1000.0
+    else:
+        # If Ad selected and no subscription
+        if rt["Ad"] == "Yes" and rt["Subscription"] == "No" and rt["IAP"] == "No":
+            valuation_min = profit_num * 1.0
+            valuation_max = profit_num * 1.7
+        elif rt["Subscription"] == "Yes" or rt["IAP"] == "Yes":
+            valuation_min = profit_num * 1.5
+            valuation_max = profit_num * 2.3
+        else:
+            # fallback
+            valuation_min = valuation_max = profit_num * 2.5
+    estimated = (valuation_min + valuation_max) / 2.0
+    if valuation_min == valuation_max:
+        formatted = f"{valuation_min:,.2f}"
+    else:
+        formatted = f"{valuation_min:,.2f} to {valuation_max:,.2f}"
+    # return numeric min/max/avg and string with currency formatting
+    return valuation_min, valuation_max, estimated, f"${formatted}"
+
+def append_row_to_sheet(row):
+    if sheet is None:
+        logger.warning("Sheet not initialized; skipping append.")
+        return False
+    try:
+        sheet.append_row(row)
+        logger.info("Appended row to sheet.")
+        return True
+    except Exception as e:
+        logger.exception("Failed to append to Google Sheet: %s", e)
         return False
 
-def is_valid_appstore_link(url):
-    return url.startswith("https://apps.apple.com")
-
-def is_valid_playstore_link(url):
-    return url.startswith("https://play.google.com")
-
-def is_number(text):
-    text = text.strip().replace(",", "")
-    return re.fullmatch(r"\d+(\.\d+)?", text) is not None
-
-def parse_number(text):
-    return float(text.strip().replace(",", ""))
-
-# ---------- Valuation calculation (matches your Supabase function logic) ----------
-def compute_valuation(profit_value, revenue_types_str):
-    profit_num = float(profit_value or 0)
-    rt = (revenue_types_str or "").lower()
-
-    valuation_min = valuation_max = estimated = 0.0
-    formatted = ""
-
-    if profit_num <= 0 or profit_num < 1000:
-        valuation_min = valuation_max = estimated = 1000.0
-        formatted = "$1,000"
-    elif "ad" in rt and "sub" not in rt and "iap" not in rt and len(rt.strip()) > 0:
-        # If only ad selected
-        valuation_min = profit_num * 1.0
-        valuation_max = profit_num * 1.7
-        estimated = (valuation_min + valuation_max) / 2
-        formatted = f"{valuation_min:,.2f} to {valuation_max:,.2f}"
-    elif "sub" in rt or "subscription" in rt or "iap" in rt or "others" in rt or "other" in rt:
-        valuation_min = profit_num * 1.5
-        valuation_max = profit_num * 2.3
-        estimated = (valuation_min + valuation_max) / 2
-        formatted = f"{valuation_min:,.2f} to {valuation_max:,.2f}"
-    else:
-        # fallback multiplier
-        multiplier = 2.5
-        estimated = profit_num * multiplier
-        valuation_min = valuation_max = estimated
-        formatted = f"{estimated:,.2f}"
-
-    return {
-        "valuationMin": round(valuation_min, 2),
-        "valuationMax": round(valuation_max, 2),
-        "estimatedValuation": round(estimated, 2),
-        "formattedValuation": formatted
-    }
-
-# ---------- Save to Google Sheet ----------
-def save_to_sheet_row(row_data):
+def call_supabase_function(payload):
     """
-    row_data: dict mapping header -> value
-    We'll append as a row. Save headers if sheet empty.
+    Invoke Supabase Edge Function 'send-valuation' with the payload.
+    Uses SERVICE_ROLE_KEY if present for Authorization, otherwise uses anon key.
     """
-    if not sheet:
-        app.logger.warning("Sheet not configured - skipping save")
-        return False, "Sheet not configured"
+    if not SUPABASE_URL:
+        logger.warning("SUPABASE_URL not set; skipping supabase function call.")
+        return None, "no-supabase-url"
 
+    fn_url = SUPABASE_URL.rstrip("/") + f"/functions/v1/{SUPABASE_FUNCTION_NAME}"
+    headers = {"Content-Type": "application/json"}
+    # prefer service role for privileged operations:
+    auth_key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY
+    if not auth_key:
+        logger.warning("No supabase key found; cannot call function.")
+        return None, "no-supabase-key"
+    headers["apikey"] = SUPABASE_ANON_KEY or auth_key
+    headers["Authorization"] = f"Bearer {auth_key}"
     try:
-        values = sheet.get_all_values()
-        if not values or len(values) == 0:
-            headers = list(row_data.keys())
-            sheet.append_row(headers)
-        row = [row_data.get(k, "") for k in list(row_data.keys())]
-        sheet.append_row(row)
-        return True, None
+        r = requests.post(fn_url, headers=headers, json=payload, timeout=15)
+        try:
+            r.raise_for_status()
+        except Exception as e:
+            logger.error("Supabase function returned error %s: %s", r.status_code, r.text)
+            # return response details
+            return r, f"http-{r.status_code}"
+        logger.info("Supabase function invoked successfully.")
+        return r, None
     except Exception as e:
-        app.logger.exception("Failed to save to sheet: %s", e)
-        return False, str(e)
+        logger.exception("Error invoking supabase function: %s", e)
+        return None, str(e)
 
-# ---------- Send email via SMTP (Gmail) ----------
-def send_email(to_email, subject, html_body, cc_list=None, from_addr=None):
-    from_addr = from_addr or SMTP_USER
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = from_addr
-    msg["To"] = to_email
-    if cc_list:
-        msg["Cc"] = ", ".join(cc_list)
-    msg.set_content(re.sub('<[^<]+?>', '', html_body))  # plaintext fallback
-    msg.add_alternative(html_body, subtype='html')
-
-    all_recipients = [to_email] + (cc_list or [])
-
-    try:
-        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=15)
-        server.ehlo()
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg, from_addr=from_addr, to_addrs=all_recipients)
-        server.quit()
-        return True, None
-    except Exception as e:
-        app.logger.exception("Failed to send email: %s", e)
-        return False, str(e)
-
-# ---------- Build valuation email HTML ----------
-def build_valuation_email_html(name, formatted_valuation, app_link):
-    safe_name = name or "there"
-    html = f"""
-    <div style="font-family: Arial, sans-serif; max-width:600px;">
-      <p>Hi {safe_name},</p>
-      <p>Thank you for using our valuation tool — based on the details you provided, here is your app's estimated valuation:</p>
-      <h2 style="color:#007bff;">{formatted_valuation}</h2>
-      <p>This is an estimate; final valuation may vary.</p>
-      <p>App link: {app_link or '—'}</p>
-      <p>Best regards,<br/>KalaGato Team</p>
-    </div>
+# ---------- Question flow helpers ----------
+def get_questions_for_listing(listing):
     """
-    return html
+    listing: 'app store', 'play store', 'both'
+    Returns list of question prompts in order AFTER the listing selection.
+    We always ask name first before listing selection in the main flow.
+    """
+    qs = []
+    # After listing was chosen we will ask links accordingly later.
+    # THIS function returns the numeric questions etc that come after links.
+    qs += [
+        "What is your last 12 months revenue? (Numbers only)",
+        "What is your last 12 months profit? (Numbers only)",
+        "What is your last 12 months spends? (Numbers only)",
+        "What is your monthly profit? (Numbers only)",
+        "What is your annual marketing cost (USD)? Enter numbers only.",
+        "What is your annual server cost (USD)? Enter numbers only.",
+        "What is your annual profit (USD)? Enter numbers only.",
+        "Which revenue types? Reply with numbers separated by commas:\n1) IAP\n2) Subscription\n3) Ad (example: 1,3)",
+        "Please share your email address (we will send valuation there)."
+    ]
+    return qs
 
 # ---------- Webhook endpoint ----------
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
+    # Verification challenge for GET
     if request.method == "GET":
-        if request.args.get("hub.verify_token") == VERIFY_TOKEN:
-            return request.args.get("hub.challenge")
-        return "Invalid verification token", 403
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        if token == VERIFY_TOKEN:
+            return challenge, 200
+        return "Invalid verify token", 403
 
-    data = request.get_json(silent=True) or {}
-    # basic safety
-    if "entry" not in data:
-        return "OK", 200
+    data = request.get_json(silent=True)
+    if not data:
+        logger.warning("Webhook invoked with no JSON.")
+        return "ok", 200
 
-    for entry in data.get("entry", []):
+    # Parse incoming messages in the structure Facebook sends
+    entries = data.get("entry", [])
+    for entry in entries:
         for change in entry.get("changes", []):
             value = change.get("value", {})
-            messages = value.get("messages", []) or []
-            for msg in messages:
-                user_id = msg.get("from")
-                text = msg.get("text", {}).get("body", "").strip()
-                button_reply_id = msg.get("interactive", {}).get("button_reply", {}).get("id")
-                # guard
-                if not user_id:
-                    continue
+            messages = value.get("messages", [])
+            if not messages:
+                continue
+            msg = messages[0]
+            user_id = msg.get("from")
+            # message text or interactive reply
+            text = msg.get("text", {}).get("body", "")
+            interactive = msg.get("interactive", {})
+            button_reply_id = None
+            if interactive:
+                # button or list reply
+                br = interactive.get("button_reply") or interactive.get("list_reply")
+                if br:
+                    button_reply_id = br.get("id") or br.get("title") or None
 
-                state = user_states.get(user_id)
+            # Initialize state if new user
+            state = user_states.get(user_id)
+            if not state:
+                # new user
+                # greet them only when they send "hi" or similar, else send greeting
+                # We'll send initial greeting always for simplicity
+                send_whatsapp_buttons(
+                    user_id,
+                    "Hi, I am Kalagato AI Agent. Are you interested in selling your app?",
+                    ["Yes", "No"]
+                )
+                # state keys:
+                # step: -1 waiting for initial yes/no
+                # responses: list of raw responses (first element will be their "Yes"/"No" or listing etc)
+                # questions: the remaining questions prompts mapping to responses
+                user_states[user_id] = {
+                    "step": -1,
+                    "responses": [],
+                    "questions": [],
+                    "listing": None,  # 'app store'/'play store'/'both'
+                    "awaiting": "initial_yesno"  # simple intent tracker
+                }
+                continue
 
-                # New user starts here
-                if not state:
-                    # greet when user says hi/hello or any first message
-                    send_whatsapp_message(
-                        user_id,
-                        "Hi, I am Kalagato AI Agent. Are you interested in selling your app?",
-                        buttons=[{"id":"yes","title":"Yes"},{"id":"no","title":"No"}]
-                    )
-                    user_states[user_id] = {"step": "await_greeting", "responses": {}}
-                    continue
+            # existing user
+            awaiting = state.get("awaiting")
+            step = state.get("step", 0)
 
-                step = state.get("step")
-
-                # Handle initial yes/no
-                if step == "await_greeting":
-                    reply = (button_reply_id or text).strip().lower()
-                    if reply in ("no", "n"):
-                        send_whatsapp_message(user_id, "Thanks — if you have any queries contact us on aman@kalagato.co")
-                        user_states.pop(user_id, None)
-                        continue
-                    elif reply in ("yes", "y"):
-                        # start chain: ask name
-                        state["step"] = "ask_name"
-                        send_whatsapp_message(user_id, "Great — what's your name?")
-                        continue
-                    else:
-                        send_whatsapp_message(user_id, "Please select Yes or No.", buttons=[{"id":"yes","title":"Yes"},{"id":"no","title":"No"}])
-                        continue
-
-                # Ask name
-                if step == "ask_name":
-                    name = text or button_reply_id or ""
-                    if not name:
-                        send_whatsapp_message(user_id, "Please tell us your name.")
-                        continue
-                    state["responses"]["name"] = name.strip()
-                    state["step"] = "ask_listing"
-                    # ask listing with buttons
-                    send_whatsapp_message(
-                        user_id,
-                        "Is your app listed on Play Store, App Store, or Both?",
-                        buttons=[{"id":"playstore","title":"Play Store"},{"id":"appstore","title":"App Store"},{"id":"both","title":"Both"}]
-                    )
-                    continue
-
-                # Handle listing selection
-                if step == "ask_listing":
-                    listing = (button_reply_id or text).strip().lower()
-                    # normalize
-                    if listing in ("playstore","play store","play"):
-                        state["responses"]["listing"] = "playstore"
-                    elif listing in ("appstore","app store","app"):
-                        state["responses"]["listing"] = "appstore"
-                    elif listing in ("both","both stores"):
-                        state["responses"]["listing"] = "both"
-                    else:
-                        send_whatsapp_message(user_id, "Please choose Play Store, App Store, or Both.", buttons=[{"id":"playstore","title":"Play Store"},{"id":"appstore","title":"App Store"},{"id":"both","title":"Both"}])
-                        continue
-
-                    # next: ask for the relevant link(s)
-                    if state["responses"]["listing"] == "playstore":
-                        state["step"] = "ask_play_link"
-                        send_whatsapp_message(user_id, "Please provide the Play Store link (https://play.google.com/...)")
-                    elif state["responses"]["listing"] == "appstore":
-                        state["step"] = "ask_app_link"
-                        send_whatsapp_message(user_id, "Please provide the App Store link (https://apps.apple.com/...)")
-                    else:
-                        # both
-                        state["step"] = "ask_play_link"
-                        state["sub_next"] = "ask_app_link"  # chain to ask app link next
-                        send_whatsapp_message(user_id, "Please provide the Play Store link (https://play.google.com/...)")
-                    continue
-
-                # Play store link
-                if step == "ask_play_link":
-                    link = text.strip()
-                    if not is_valid_playstore_link(link):
-                        send_whatsapp_message(user_id, "❌ Invalid Play Store link. Please provide a valid URL starting with https://play.google.com")
-                        continue
-                    state["responses"]["play_link"] = link
-                    # either go to app link next or continue to next numeric questions
-                    if state.get("sub_next") == "ask_app_link":
-                        state["step"] = "ask_app_link"
-                        state.pop("sub_next", None)
-                        send_whatsapp_message(user_id, "Please provide the App Store link (https://apps.apple.com/...) or reply 'skip' to skip.")
-                        continue
-                    else:
-                        # proceed to revenue questions
-                        state["step"] = "ask_revenue"
-                        send_whatsapp_message(user_id, "What is your annual revenue (USD)? Reply with numbers only.")
-                        continue
-
-                # App store link
-                if step == "ask_app_link":
-                    if text.strip().lower() == "skip":
-                        state["responses"]["app_link"] = ""
-                        state["step"] = "ask_revenue"
-                        send_whatsapp_message(user_id, "What is your annual revenue (USD)? Reply with numbers only.")
-                        continue
-                    link = text.strip()
-                    if not is_valid_appstore_link(link):
-                        send_whatsapp_message(user_id, "❌ Invalid App Store link. Please provide a valid URL starting with https://apps.apple.com or 'skip' to skip.")
-                        continue
-                    state["responses"]["app_link"] = link
-                    state["step"] = "ask_revenue"
-                    send_whatsapp_message(user_id, "What is your annual revenue (USD)? Reply with numbers only.")
-                    continue
-
-                # Numeric questions in order: revenue, marketing cost, server cost, profit
-                if step == "ask_revenue":
-                    if not is_number(text):
-                        send_whatsapp_message(user_id, "❌ Please enter a number for annual revenue (digits only).")
-                        continue
-                    state["responses"]["annual_revenue"] = text.strip()
-                    state["step"] = "ask_marketing"
-                    send_whatsapp_message(user_id, "What is your annual marketing cost (USD)? Enter numbers only.")
-                    continue
-
-                if step == "ask_marketing":
-                    if not is_number(text):
-                        send_whatsapp_message(user_id, "❌ Please enter a number for marketing cost.")
-                        continue
-                    state["responses"]["marketing_cost"] = text.strip()
-                    state["step"] = "ask_server"
-                    send_whatsapp_message(user_id, "What is your annual server cost (USD)? Enter numbers only.")
-                    continue
-
-                if step == "ask_server":
-                    if not is_number(text):
-                        send_whatsapp_message(user_id, "❌ Please enter a number for server cost.")
-                        continue
-                    state["responses"]["server_cost"] = text.strip()
-                    state["step"] = "ask_profit"
-                    send_whatsapp_message(user_id, "What is your annual profit (USD)? Enter numbers only.")
-                    continue
-
-                if step == "ask_profit":
-                    if not is_number(text):
-                        send_whatsapp_message(user_id, "❌ Please enter a number for annual profit.")
-                        continue
-                    state["responses"]["annual_profit"] = text.strip()
-                    # revenue type: ask to reply with comma separated options
-                    state["step"] = "ask_revenue_types"
-                    send_whatsapp_message(user_id, "Which revenue types? Reply using commas (Ad, Subscription, IAP). Example: Ad, IAP")
-                    continue
-
-                if step == "ask_revenue_types":
-                    # accept comma separated values
-                    types_text = text.strip()
-                    if not types_text:
-                        send_whatsapp_message(user_id, "Please reply with revenue types (Ad, Subscription, IAP) separated by commas.")
-                        continue
-                    # normalize
-                    chosen = [t.strip().lower() for t in types_text.split(",") if t.strip()]
-                    state["responses"]["revenue_types"] = ",".join(chosen)
-                    state["step"] = "ask_email"
-                    send_whatsapp_message(user_id, "Please share your email address (we will send valuation there).")
-                    continue
-
-                if step == "ask_email":
-                    email = text.strip()
-                    # basic email validation
-                    if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
-                        send_whatsapp_message(user_id, "❌ Please provide a valid email address.")
-                        continue
-                    state["responses"]["email"] = email
-                    # Done collecting — compute valuation, save to sheet, call supabase function, send email
-                    responses = state["responses"]
-                    # compute valuation
-                    val = compute_valuation(responses.get("annual_profit", "0"), responses.get("revenue_types", ""))
-                    estimated_val = val["estimatedValuation"]
-                    formatted_val = val["formattedValuation"] if val["formattedValuation"] else f"${estimated_val:,.2f}"
-
-                    # save to sheet (columns: Timestamp, WhatsApp, Name, Listing, AppStoreLink, PlayStoreLink,
-                    # AnnualRevenue, MarketingCost, ServerCost, AnnualProfit, RevenueTypes, EstimatedValuation, Email)
-                    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                    row_map = {
-                        "Timestamp": now,
-                        "WhatsApp": user_id,
-                        "Name": responses.get("name",""),
-                        "Listing": responses.get("listing",""),
-                        "AppStoreLink": responses.get("app_link",""),
-                        "PlayStoreLink": responses.get("play_link",""),
-                        "AnnualRevenue": responses.get("annual_revenue",""),
-                        "MarketingCost": responses.get("marketing_cost",""),
-                        "ServerCost": responses.get("server_cost",""),
-                        "AnnualProfit": responses.get("annual_profit",""),
-                        "RevenueTypes": responses.get("revenue_types",""),
-                        "EstimatedValuation": str(estimated_val),
-                        "Email": responses.get("email","")
-                    }
-                    ok, err = save_to_sheet_row(row_map)
-                    if not ok:
-                        send_whatsapp_message(user_id, "✅ Saved your data, but we couldn't save to Google Sheets. Please contact aman@kalagato.co if needed.")
-                    else:
-                        # call supabase function if set (do not rely on this for email)
-                        if SUPABASE_FUNCTION_URL:
-                            try:
-                                requests.post(SUPABASE_FUNCTION_URL, json={**responses, "estimatedValuation": estimated_val}, timeout=6)
-                            except Exception as ex:
-                                app.logger.warning("Failed to call supabase function: %s", ex)
-
-                    # send email using SMTP from this app (so we can CC)
-                    html = build_valuation_email_html(responses.get("name",""), formatted_val, responses.get("app_link") or responses.get("play_link"))
-                    sent, send_err = send_email(responses.get("email"), "Your App Valuation Estimate is Here!", html, cc_list=CC_EMAILS, from_addr=SMTP_USER)
-                    if sent:
-                        send_whatsapp_message(user_id, f"✅ Thank you {responses.get('name','')}. We've sent your valuation ({formatted_val}) to your email.")
-                    else:
-                        send_whatsapp_message(user_id, "✅ Saved your data, but we couldn't send the email automatically. Please contact aman@kalagato.co if needed.")
-                        app.logger.error("Email send error: %s", send_err)
-
+            # If awaiting initial yes/no (buttons)
+            if awaiting == "initial_yesno":
+                chosen = (button_reply_id or text).strip().lower()
+                if chosen in ("no", "n"):
+                    send_whatsapp_text(user_id, "Thanks, if you have any queries contact us on aman@kalagato.co")
                     # cleanup
                     user_states.pop(user_id, None)
                     continue
+                elif chosen in ("yes", "y"):
+                    # ask for name first
+                    send_whatsapp_text(user_id, "Great — what's your name?")
+                    state["awaiting"] = "name"
+                    state["responses"] = []  # reset
+                    state["step"] = 0
+                    continue
+                else:
+                    send_whatsapp_buttons(user_id, "Please select Yes or No:", ["Yes", "No"])
+                    continue
 
-                # fallback
-                send_whatsapp_message(user_id, "Sorry — I didn't understand. Please follow the prompts.")
+            # Name
+            if awaiting == "name":
+                name = button_reply_id or text
+                if not name or name.strip() == "":
+                    send_whatsapp_text(user_id, "Please tell us your name.")
+                    continue
+                state["responses"].append(name.strip())
+                # ask listing next
+                send_whatsapp_buttons(user_id, "Is your app listed on App Store, Play Store, or Both?", ["App Store", "Play Store", "Both"])
+                state["awaiting"] = "listing"
+                continue
+
+            # Listing selection
+            if awaiting == "listing":
+                chosen = (button_reply_id or text).strip().lower()
+                if chosen in ("app store", "appstore", "app store"):
+                    state["listing"] = "app store"
+                    # ask appstore link
+                    send_whatsapp_text(user_id, "Please provide the App Store link (https://apps.apple.com/...).")
+                    state["awaiting"] = "app_store_link"
+                    continue
+                if chosen in ("play store", "playstore", "play store"):
+                    state["listing"] = "play store"
+                    send_whatsapp_text(user_id, "Please provide the Play Store link (https://play.google.com/...).")
+                    state["awaiting"] = "play_store_link"
+                    continue
+                if chosen in ("both",):
+                    state["listing"] = "both"
+                    send_whatsapp_text(user_id, "Please provide the App Store link (https://apps.apple.com/...). If none, reply skip.")
+                    state["awaiting"] = "app_store_link"
+                    # we'll then ask play store link after
+                    continue
+                # if user typed something unexpected
+                send_whatsapp_buttons(user_id, "Please choose one:", ["App Store", "Play Store", "Both"])
+                continue
+
+            # App Store link entry
+            if awaiting == "app_store_link":
+                val = (button_reply_id or text or "").strip()
+                if val.lower() == "skip":
+                    state["responses"].append("")  # empty app store link
+                else:
+                    if not (val.startswith("https://apps.apple.com") or val.startswith("http://apps.apple.com")):
+                        send_whatsapp_text(user_id, "❌ Invalid App Store link. Please provide a valid URL starting with https://apps.apple.com or reply 'skip' to skip.")
+                        continue
+                    state["responses"].append(val)
+                # next: if listing==both ask play store, else proceed with numeric questions
+                if state["listing"] == "both":
+                    send_whatsapp_text(user_id, "Please provide the Play Store link (https://play.google.com/...). If none, reply skip.")
+                    state["awaiting"] = "play_store_link"
+                else:
+                    # move to numeric question sequence
+                    qlist = get_questions_for_listing(state["listing"])
+                    state["questions"] = qlist
+                    state["step"] = 0
+                    state["awaiting"] = "question_answer"
+                    send_whatsapp_text(user_id, state["questions"][0])
+                continue
+
+            # Play Store link entry
+            if awaiting == "play_store_link":
+                val = (button_reply_id or text or "").strip()
+                if val.lower() == "skip":
+                    state["responses"].append("")  # empty play store link
+                else:
+                    if not (val.startswith("https://play.google.com") or val.startswith("http://play.google.com")):
+                        send_whatsapp_text(user_id, "❌ Invalid Play Store link. Please provide a valid URL starting with https://play.google.com or reply 'skip' to skip.")
+                        continue
+                    state["responses"].append(val)
+                # after collecting links, move to numeric questions
+                qlist = get_questions_for_listing(state["listing"])
+                state["questions"] = qlist
+                state["step"] = 0
+                state["awaiting"] = "question_answer"
+                send_whatsapp_text(user_id, state["questions"][0])
+                continue
+
+            # Handling numeric and remaining questions
+            if awaiting == "question_answer":
+                # current question text
+                qidx = state["step"]
+                questions = state.get("questions", [])
+                if qidx >= len(questions):
+                    # Shouldn't happen - but finalize
+                    logger.warning("Step index beyond questions for %s", user_id)
+                    send_whatsapp_text(user_id, "An error happened; please try again.")
+                    user_states.pop(user_id, None)
+                    continue
+                current_q = questions[qidx]
+                answer = (button_reply_id or text or "").strip()
+                # Validate based on question
+                ql = current_q.lower()
+                # numeric validations
+                if any(k in ql for k in ["revenue", "profit", "spend", "marketing", "server", "monthly profit"]):
+                    if not _is_number_text(answer):
+                        send_whatsapp_text(user_id, "❌ Please enter a valid number (commas and $ OK).")
+                        continue
+                # email validation
+                if "email" in ql:
+                    if not re.match(r"[^@]+@[^@]+\.[^@]+", answer):
+                        send_whatsapp_text(user_id, "❌ Please enter a valid email address.")
+                        continue
+                # revenue types question expects CSV / numbered answers - accept free text but don't strictly validate
+                # Save answer
+                state.setdefault("responses", state.get("responses", []))
+                state["responses"].append(answer)
+                state["step"] = state["step"] + 1
+
+                # next question or finish
+                if state["step"] < len(state["questions"]):
+                    next_q = state["questions"][state["step"]]
+                    send_whatsapp_text(user_id, next_q)
+                    continue
+                else:
+                    # Completed sequence -> save to sheet and call supabase function to send email
+                    # Build a payload from responses
+                    try:
+                        # Responses order:
+                        # state["responses"] currently contains:
+                        # [name, app_store_link(if asked) or '', play_store_link(if asked) or '', q1, q2, ..., qN]
+                        # but because we appended links earlier before numeric questions, the indices need careful mapping.
+                        # We'll reconstruct robustly by using known question prompts:
+                        all_resps = state["responses"][:]  # copy
+                        name = all_resps[0] if len(all_resps) > 0 else ""
+                        # Next items depend on whether app/play links were asked:
+                        link_idx = 1
+                        app_store_link = ""
+                        play_store_link = ""
+                        if state["listing"] in ("app store", "both"):
+                            app_store_link = all_resps[link_idx]
+                            link_idx += 1
+                        if state["listing"] in ("play store", "both"):
+                            play_store_link = all_resps[link_idx]
+                            link_idx += 1
+
+                        # numeric answers start at link_idx
+                        remaining = all_resps[link_idx:]
+                        # Our questions sequence inside get_questions_for_listing was:
+                        # [revenue, profit, spends, monthly profit, marketing cost, server cost, annual profit, revenue types, email]
+                        # Map them accordingly:
+                        r_revenue = remaining[0] if len(remaining) > 0 else ""
+                        r_profit = remaining[1] if len(remaining) > 1 else ""
+                        r_spends = remaining[2] if len(remaining) > 2 else ""
+                        r_monthly_profit = remaining[3] if len(remaining) > 3 else ""
+                        r_marketing = remaining[4] if len(remaining) > 4 else ""
+                        r_server = remaining[5] if len(remaining) > 5 else ""
+                        r_annual_profit = remaining[6] if len(remaining) > 6 else ""
+                        r_revenue_types = remaining[7] if len(remaining) > 7 else ""
+                        r_email = remaining[8] if len(remaining) > 8 else ""
+
+                        # parse numbers to floats for valuation
+                        annual_profit_value = _parse_number(r_annual_profit)
+                        valuation_min, valuation_max, estimated_avg, formatted = compute_valuation(annual_profit_value, r_revenue_types)
+
+                        # Prepare sheet row (customize columns as you like)
+                        # Example column order:
+                        # Timestamp, Name, Listing, AppStoreLink, PlayStoreLink,
+                        # AnnualRevenue, AnnualProfit, AnnualSpends, MonthlyProfit, MarketingCost, ServerCost,
+                        # IAP (Yes/No), Subscription (Yes/No), Ad (Yes/No), Email, ValuationAvg
+                        rt_flags = _parse_revenue_types(r_revenue_types)
+                        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                        row = [
+                            timestamp,
+                            name,
+                            state["listing"] or "",
+                            app_store_link,
+                            play_store_link,
+                            _parse_number(r_revenue),
+                            _parse_number(r_annual_profit),
+                            _parse_number(r_spends),
+                            _parse_number(r_monthly_profit),
+                            _parse_number(r_marketing),
+                            _parse_number(r_server),
+                            rt_flags["IAP"],
+                            rt_flags["Subscription"],
+                            rt_flags["Ad"],
+                            r_email,
+                            f"{estimated_avg:.2f}"
+                        ]
+                        append_row_to_sheet(row)
+
+                        # Call supabase function to send email
+                        payload = {
+                            "name": name,
+                            "revenueType": r_revenue_types,
+                            "appLink": app_store_link or play_store_link or "",
+                            "revenue": _parse_number(r_revenue),
+                            "marketingCost": _parse_number(r_marketing),
+                            "serverCost": _parse_number(r_server),
+                            "profit": _parse_number(r_annual_profit),
+                            "email": r_email
+                        }
+                        # include cc list if provided (function must respect it)
+                        if EMAIL_CCS:
+                            cc_list = [e.strip() for e in EMAIL_CCS.split(",") if e.strip()]
+                            if cc_list:
+                                payload["cc"] = cc_list
+
+                        resp, err = call_supabase_function(payload)
+                        if err:
+                            logger.error("Supabase function returned error tag: %s", err)
+                            send_whatsapp_text(user_id, "✅ Saved your data, but we couldn't send the email automatically. Please contact aman@kalagato.co if needed.")
+                        else:
+                            send_whatsapp_text(user_id, f"✅ Thank you {name}. We've sent your valuation ({formatted}) to your email.")
+                    except Exception as e:
+                        logger.exception("Error completing flow for user %s: %s", user_id, e)
+                        send_whatsapp_text(user_id, "Sorry, something went wrong while saving your data. Please try again later.")
+                    # cleanup user state
+                    user_states.pop(user_id, None)
+                    continue
+
     return "OK", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, debug=(LOG_LEVEL=="DEBUG"))
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
