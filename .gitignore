@@ -1,23 +1,7 @@
-# Python
 __pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-env/
-venv/
+*.pyc
 .env
-.env.* 
-service_account.json
-google_credentials.json
-*.sqlite3
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Editor
-.vscode/
+*.json
+venv/
 .idea/
-
-# Logs
-*.log
+.DS_Store
