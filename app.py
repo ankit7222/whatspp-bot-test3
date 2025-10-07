@@ -1,4 +1,4 @@
-# app.py (updated: name-first flow, multi-choice revenue input, consistent valuation)
+# app.py
 import os
 import json
 import time
@@ -12,7 +12,7 @@ from gspread.exceptions import WorksheetNotFound
 app = Flask(__name__)
 app.logger.setLevel("INFO")
 
-# ------------- Config (env) -------------
+# ----------------- Config from env -----------------
 GOOGLE_CREDS_ENV = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "").strip()
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1").strip()
@@ -26,9 +26,10 @@ SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY", "").strip()
 
 WHATSAPP_API_URL = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
 WHATSAPP_HEADERS = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
-# ------------- Google Sheets init -------------
+# ----------------- Google Sheets init (robust) -----------------
 _gs_client = None
 _worksheet = None
 _gs_init_error = None
@@ -36,13 +37,16 @@ _gs_init_error = None
 def _load_service_account_info():
     raw = GOOGLE_CREDS_ENV
     if raw:
+        # if a filename provided and exists, load it
         if raw.endswith(".json") and os.path.exists(raw):
             with open(raw, "r") as f:
                 return json.load(f)
+        # try parse JSON directly (multi-line allowed)
         try:
             return json.loads(raw)
         except Exception as e:
             app.logger.warning("Failed to parse GOOGLE_SHEETS_CREDENTIALS: %s", e)
+    # fallback to local file
     if os.path.exists("service_account.json"):
         with open("service_account.json", "r") as f:
             return json.load(f)
@@ -79,7 +83,7 @@ def try_init_gs():
         app.logger.error(_gs_init_error)
         return None
 
-# ------------- WhatsApp helpers -------------
+# ----------------- WhatsApp helpers -----------------
 def send_whatsapp_text(to, text):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         app.logger.debug("WhatsApp not configured - skipping send.")
@@ -111,7 +115,7 @@ def send_whatsapp_buttons(to, text, buttons):
     except Exception as e:
         app.logger.error("WA send failed: %s", e)
 
-# ------------- Validation helpers -------------
+# ----------------- Validation helpers -----------------
 def is_valid_url(u, store):
     if not u: return False
     u = u.strip()
@@ -132,6 +136,8 @@ def is_number(s):
 
 def parse_number(s):
     try:
+        if s is None:
+            return None
         return float(str(s).replace(",","").strip())
     except:
         return None
@@ -140,8 +146,33 @@ def is_valid_email(e):
     if not e: return False
     return "@" in e and "." in e
 
-# ------------- Valuation logic -------------
+# ----------------- Revenue normalization -----------------
+def normalize_revenue_input(incoming: str):
+    if not incoming:
+        return ""
+    s = incoming.strip().lower()
+    mapping = {"1":"IAP","2":"Subscription","3":"Ad","iap":"IAP","subscription":"Subscription","sub":"Subscription","ad":"Ad"}
+    parts = [p.strip() for p in s.replace(";",",").split(",") if p.strip()]
+    results = []
+    for p in parts:
+        if p in mapping:
+            results.append(mapping[p])
+            continue
+        if p.startswith("ad"):
+            results.append("Ad"); continue
+        if "iap" in p or "in-app" in p or "in app" in p:
+            results.append("IAP"); continue
+        if "sub" in p:
+            results.append("Subscription"); continue
+    seen = set(); out = []
+    for item in results:
+        if item not in seen:
+            out.append(item); seen.add(item)
+    return ", ".join(out)
+
+# ----------------- Valuation logic (same rules used by bot) -----------------
 def compute_valuation(profit_val, revenue_type_text):
+    # profit_val is expected to be numeric already (float) or parseable
     try:
         profit = float(profit_val) if profit_val not in (None,"") else 0.0
     except:
@@ -159,7 +190,7 @@ def compute_valuation(profit_val, revenue_type_text):
         vmin = profit * 2.5; vmax = profit * 2.5
     return vmin, vmax, (vmin + vmax) / 2.0
 
-# ------------- Save to sheet -------------
+# ----------------- Save to Google Sheets -----------------
 def save_to_sheet(user_id, answers, valuation_text):
     ws = try_init_gs()
     if ws is None:
@@ -178,7 +209,7 @@ def save_to_sheet(user_id, answers, valuation_text):
         answers.get("marketing_cost",""),
         answers.get("server_cost",""),
         answers.get("annual_profit",""),
-        answers.get("revenue_type",""),
+        answers.get("revenue_type_normalized",""),
         answers.get("email",""),
         valuation_text
     ]
@@ -190,86 +221,79 @@ def save_to_sheet(user_id, answers, valuation_text):
         app.logger.error("Failed to append row: %s", e)
         return False
 
-# ------------- Call Supabase Function -------------
+# ----------------- Call Supabase Edge Function (robust logging & payload) -----------------
 def call_supabase_send_email(payload: dict):
     if not SUPABASE_FUNCTION_URL:
         app.logger.warning("SUPABASE_FUNCTION_URL not configured.")
         return False, "No function URL"
+
+    # Ensure numeric profit is present
+    ap = payload.get("annual_profit_numeric", None)
+    if ap is None:
+        ap = parse_number(payload.get("data", {}).get("annual_profit"))
+        payload["annual_profit_numeric"] = ap
+
+    # Ensure revenue_type_normalized is present
+    if not payload.get("revenue_type_normalized"):
+        payload["revenue_type_normalized"] = payload.get("data", {}).get("revenue_type", "")
+
+    # Ensure valuation_text is present (last resort compute here)
+    if not payload.get("valuation_text"):
+        try:
+            profit_val = payload.get("annual_profit_numeric", 0) or 0
+            rt = payload.get("revenue_type_normalized", "")
+            vmin, vmax, mid = compute_valuation(profit_val, rt)
+            if vmin == vmax:
+                payload["valuation_text"] = f"${vmin:,.2f}"
+            else:
+                payload["valuation_text"] = f"${vmin:,.2f} to ${vmax:,.2f}"
+        except Exception as e:
+            app.logger.exception("Failed to compute fallback valuation: %s", e)
+            payload["valuation_text"] = "$1,000"
+
+    # Add hint that Supabase should prefer provided valuation_text
+    payload["force_valuation"] = True
+
+    app.logger.info(
+        "Calling Supabase function; email=%s profit=%s revenue_type=%s valuation=%s",
+        payload.get("email"),
+        payload.get("annual_profit_numeric"),
+        payload.get("revenue_type_normalized"),
+        payload.get("valuation_text")
+    )
+
     headers = {"Content-Type":"application/json"}
     if SUPABASE_API_KEY:
         headers["Authorization"] = f"Bearer {SUPABASE_API_KEY}"
+
     try:
-        r = requests.post(SUPABASE_FUNCTION_URL, json=payload, headers=headers, timeout=12)
+        r = requests.post(SUPABASE_FUNCTION_URL, json=payload, headers=headers, timeout=15)
+        app.logger.info("Supabase function response status=%s text=%s", r.status_code, (r.text[:300] + "...") if r.text and len(r.text)>300 else r.text)
         if r.status_code in (200,201,202):
-            app.logger.info("Supabase function called successfully")
             return True, r.text
         else:
-            app.logger.error("Supabase function returned %s: %s", r.status_code, r.text)
             return False, r.text
     except Exception as e:
-        app.logger.error("Supabase function call failed: %s", e)
+        app.logger.exception("Call to Supabase function failed: %s", e)
         return False, str(e)
 
-# ------------- Conversation flow (NAME first, then listing) -------------
+# ----------------- Conversation flow -----------------
 user_states = {}
 processed_msg_ids = set()
 SESSION_TIMEOUT_SECONDS = 15 * 60
 
-# base sequences (name will be explicitly injected)
 OTHER_QUESTIONS = [
     {"key":"annual_revenue","text":"What is your annual revenue (USD)?","type":"number"},
     {"key":"marketing_cost","text":"What is your annual marketing cost (USD)?","type":"number"},
     {"key":"server_cost","text":"What is your annual server cost (USD)?","type":"number"},
     {"key":"annual_profit","text":"What is your annual profit (USD)?","type":"number"},
-    # revenue_type will be special: present as buttons + accept multi-select by numbers/words
-    {"key":"revenue_type","text":"Which revenue types apply? You can tap a button OR reply with numbers separated by commas (e.g. 1,3) or names (e.g. Ad, IAP):\n1) IAP\n2) Subscription\n3) Ad","type":"revenue"},
+    {"key":"revenue_type","text":"Which revenue types apply? Tap a button for single choice or reply with numbers/names for multiple (e.g. 1,3 or Ad,IAP):\n1) IAP\n2) Subscription\n3) Ad","type":"revenue"},
     {"key":"email","text":"Please share your email address (we will send valuation there)","type":"email"}
 ]
 
-def normalize_revenue_input(incoming: str):
-    """
-    Accept:
-     - button ids like 'iap', 'subscription', 'ad' (single)
-     - comma separated numbers like '1,3'
-     - comma separated names like 'Ad, IAP'
-    Return: comma-joined canonical list: 'IAP, Subscription' etc.
-    """
-    if not incoming:
-        return ""
-    s = incoming.strip().lower()
-    # direct button ids handling
-    mapping = {"1":"IAP","2":"Subscription","3":"Ad","iap":"IAP","subscription":"Subscription","sub":"Subscription","ad":"Ad"}
-    # if contains digits/commas
-    parts = [p.strip() for p in s.replace(";",",").split(",") if p.strip()]
-    results = []
-    for p in parts:
-        if p in mapping:
-            results.append(mapping[p])
-            continue
-        # if user typed full name (ad, iap, subscription)
-        if p in mapping:
-            results.append(mapping[p])
-            continue
-        # if user typed words like "ad" or "iap"
-        if p.startswith("ad"):
-            results.append("Ad"); continue
-        if "iap" in p or "in-app" in p or "in app" in p:
-            results.append("IAP"); continue
-        if "sub" in p:
-            results.append("Subscription"); continue
-        # numeric index mapping fallback
-        if p.isdigit() and p in mapping:
-            results.append(mapping[p]); continue
-    # dedupe while preserving order
-    seen = set(); out = []
-    for item in results:
-        if item not in seen:
-            out.append(item); seen.add(item)
-    return ", ".join(out)
-
 @app.route("/webhook", methods=["GET","POST"])
 def webhook():
-    # verification (GET)
+    # verification
     if request.method == "GET":
         token = request.args.get("hub.verify_token")
         if token and token == VERIFY_TOKEN:
@@ -304,10 +328,10 @@ def webhook():
             if not incoming:
                 continue
 
-            # Start session if new user
+            # start new session
             if user_id not in user_states:
                 user_states[user_id] = {
-                    "step": -1,
+                    "step": -1,  # -1 greeting
                     "answers": {},
                     "questions": [],
                     "started_at": time.time(),
@@ -324,7 +348,7 @@ def webhook():
                 continue
             state["last_active"] = time.time()
 
-            # greeting state
+            # greeting step
             if state["step"] == -1:
                 low = incoming.lower()
                 if low in ("no","no_reply"):
@@ -332,21 +356,19 @@ def webhook():
                     user_states.pop(user_id, None)
                     continue
                 if low in ("yes","yes_reply"):
-                    # ask name first (per your request)
+                    # ask name first
                     state["step"] = 0
-                    # prepare listing later after name
                     send_whatsapp_text(user_id, "What is your name?")
                     continue
                 send_whatsapp_buttons(user_id, "Please select Yes or No.", ["Yes","No"])
                 continue
 
-            # step 0 = name entered, next ask listing (Play/App/Both)
+            # step 0 = name entered
             if state["step"] == 0:
-                # treat incoming as name (no heavy validation)
                 state["answers"]["name"] = incoming
                 # now ask listing via buttons
                 send_whatsapp_buttons(user_id, "Is your app listed on Play Store, App Store, or Both?", ["Play Store","App Store","Both"])
-                state["step"] = -2  # waiting listing selection
+                state["step"] = -2  # waiting listing
                 continue
 
             # listing selection
@@ -370,25 +392,21 @@ def webhook():
                     send_whatsapp_buttons(user_id, "Please choose one: Play Store, App Store, or Both.", ["Play Store","App Store","Both"])
                     continue
                 state["answers"]["listing"] = listing
-
-                # Build questions: name is already collected; next add store links depending on selection then append OTHER_QUESTIONS
+                # build dynamic questions (store links then other questions)
                 questions = []
                 if listing == "app_store":
                     questions.append({"key":"app_store_link","text":"Please provide the App Store link (https://...)", "type":"link_appstore"})
                 elif listing == "play_store":
                     questions.append({"key":"play_store_link","text":"Please provide the Play Store link (https://...)", "type":"link_playstore"})
-                else:  # both
+                else:
                     questions.append({"key":"app_store_link","text":"Please provide the App Store link (https://...)", "type":"link_appstore"})
                     questions.append({"key":"play_store_link","text":"Please provide the Play Store link (https://...)", "type":"link_playstore"})
-
-                # append the rest
+                # append other questions
                 for q in OTHER_QUESTIONS:
                     questions.append(q.copy())
-
                 state["questions"] = questions
-                # next step index 0 into questions
-                state["step"] = 1  # note: 0 was name; 1 means first of state["questions"]
-                # ask first question (store link)
+                # next expected is index 0 in questions; step uses offset: step=1 => questions[0]
+                state["step"] = 1
                 send_whatsapp_text(user_id, state["questions"][0]["text"])
                 continue
 
@@ -397,9 +415,9 @@ def webhook():
                 app.logger.debug("Ignored stray yes/no from %s mid-flow", user_id)
                 continue
 
-            # normal question handling (state["step"] >= 1)
-            q_index = state["step"] - 1  # because step=1 corresponds to questions[0]
-            if q_index < 0 or q_index >= len(state.get("questions",[])):
+            # normal flow: step >=1 maps to questions index step-1
+            q_index = state["step"] - 1
+            if q_index < 0 or q_index >= len(state.get("questions", [])):
                 send_whatsapp_text(user_id, "Unexpected state. Please say Hi to restart.")
                 user_states.pop(user_id, None)
                 continue
@@ -408,7 +426,7 @@ def webhook():
             key = q["key"]
             val = incoming
 
-            # validation per question type
+            # validation
             valid = True
             if q["type"] == "number":
                 if not is_number(val):
@@ -423,10 +441,6 @@ def webhook():
                 if not is_valid_url(val, "play_store"):
                     valid = False
             elif q["type"] == "revenue":
-                # revenue type we'll normalize later; accept a variety of inputs
-                # allow single-button ids also (iap, subscription, ad)
-                # or comma-separated numbers or names
-                # minimal validation: accept anything non-empty
                 if not val:
                     valid = False
 
@@ -444,53 +458,49 @@ def webhook():
                 send_whatsapp_text(user_id, q["text"])
                 continue
 
-            # Save answer
+            # save answer (normalize revenue)
             if q["type"] == "revenue":
-                # if user pressed a button the button id might be 'iap' etc.
                 norm = normalize_revenue_input(val)
-                # If user used a single-button press like 'iap' we still convert
-                state["answers"][key] = norm
+                state["answers"]["revenue_type_normalized"] = norm
+                # also store raw for reference if needed
+                state["answers"]["revenue_type_raw"] = val
             else:
                 state["answers"][key] = val
 
-            # advance step
+            # advance to next
             state["step"] = state["step"] + 1
-
-            # ask next question or finish
-            next_q_index = state["step"] - 1
-            if next_q_index < len(state.get("questions",[])):
-                send_whatsapp_text(user_id, state["questions"][next_q_index]["text"])
-                # For revenue question, also send helper buttons for convenience
-                if state["questions"][next_q_index]["key"] == "revenue_type":
-                    # send buttons (note: buttons are single-select, but they help users who want a single option)
-                    send_whatsapp_buttons(user_id, "Tap a button for a single option or reply with numbers/names for multiple (e.g. 1,3 or Ad, IAP).", ["IAP","Subscription","Ad"])
+            next_index = state["step"] - 1
+            if next_index < len(state.get("questions", [])):
+                send_whatsapp_text(user_id, state["questions"][next_index]["text"])
+                # if the next question is revenue, also send buttons as a convenience
+                if state["questions"][next_index]["key"] == "revenue_type":
+                    send_whatsapp_buttons(user_id, "Tap a button for single option or reply with numbers/names for multiple (e.g. 1,3 or Ad,IAP).", ["IAP","Subscription","Ad"])
                 continue
 
-            # All done -> compute valuation, save and call Supabase function
+            # finished collecting answers
             answers = state["answers"]
-            # ensure revenue_type is normalized string
-            answers["revenue_type"] = answers.get("revenue_type","").strip()
-
+            # ensure revenue_type_normalized exists
+            answers["revenue_type_normalized"] = answers.get("revenue_type_normalized", "")
             # compute numeric profit
-            profit_numeric = parse_number(answers.get("annual_profit","")) or 0.0
-            vmin, vmax, mid = compute_valuation(profit_numeric, answers.get("revenue_type",""))
+            profit_numeric = parse_number(answers.get("annual_profit", None)) or 0.0
+            vmin, vmax, mid = compute_valuation(profit_numeric, answers.get("revenue_type_normalized", ""))
             if vmin == vmax:
                 valuation_text = f"${vmin:,.2f}"
             else:
                 valuation_text = f"${vmin:,.2f} to ${vmax:,.2f}"
 
-            # Save to Google Sheets (valuation_text is used)
+            # save to sheet (string values as provided)
             saved = save_to_sheet(user_id, answers, valuation_text)
 
-            # Prepare supabase payload: include valuation_text and numeric profit
+            # prepare supabase payload (numbers and normalized strings)
             payload_to_function = {
                 "email": answers.get("email"),
                 "name": answers.get("name"),
                 "valuation_text": valuation_text,
                 "data": answers,
-                "annual_profit_numeric": profit_numeric
+                "annual_profit_numeric": profit_numeric,
+                "revenue_type_normalized": answers.get("revenue_type_normalized", "")
             }
-            app.logger.info("Calling Supabase function with payload: email=%s profit=%s valuation=%s", answers.get("email"), profit_numeric, valuation_text)
 
             ok, resp = call_supabase_send_email(payload_to_function)
 
@@ -500,7 +510,7 @@ def webhook():
                 send_whatsapp_text(user_id, "✅ Saved your data, but we couldn't send the email automatically. Please contact aman@kalagato.co if needed.")
                 app.logger.warning("Supabase function failed: %s", resp)
 
-            # cleanup
+            # cleanup session
             user_states.pop(user_id, None)
 
     return "OK", 200
