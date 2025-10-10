@@ -355,7 +355,7 @@ def webhook():
             # start session
             if user_id not in user_states:
                 user_states[user_id] = {"step": -1, "answers": {}, "questions": [], "started_at": time.time(), "last_active": time.time()}
-                send_whatsapp_buttons(user_id, "Hi, I am Kalagato AI Agent. Are you interested in selling your app?", ["Yes","No"])
+                send_whatsapp_buttons(user_id, "Hi 👋 I’m Orion from Kalagato.We’re interested in acquiring quality apps like yours.Would you be open to selling your app if the valuation looks right?", ["Yes","No"])
                 continue
 
             state = user_states[user_id]
