@@ -12,7 +12,7 @@ from gspread.exceptions import WorksheetNotFound
 app = Flask(__name__)
 app.logger.setLevel("INFO")
 
-# ---------- ENV / Config ----------
+# ---------------- Config ----------------
 GOOGLE_CREDS_ENV = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "").strip()
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
 SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1").strip()
@@ -24,15 +24,25 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "verify_token").strip()
 SUPABASE_FUNCTION_URL = os.getenv("SUPABASE_FUNCTION_URL", "").strip()
 SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY", "").strip()
 
+# New: comma-separated CC emails for Supabase function to use (optional)
+CC_EMAILS = os.getenv("CC_EMAILS", "").strip()
+
 WHATSAPP_API_URL = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
 WHATSAPP_HEADERS = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
-# ---------- Google Sheets init ----------
+# ---------------- Google Sheets init ----------------
 _gs_client = None
 _worksheet = None
 _gs_init_error = None
+
+# desired sheet headers: Name added, Valuation will be numeric midpoint
+SHEET_HEADERS = [
+    "Timestamp", "Name", "User ID", "Listing", "App Store Link", "Play Store Link",
+    "Annual Revenue", "Marketing Cost", "Server Cost", "Annual Profit",
+    "Revenue Type", "Email", "Valuation"
+]
 
 def _load_service_account_info():
     raw = GOOGLE_CREDS_ENV
@@ -66,12 +76,16 @@ def try_init_gs():
             _worksheet = spreadsheet.worksheet(SHEET_NAME)
         except WorksheetNotFound:
             _worksheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows="2000", cols="20")
-            headers = [
-                "Timestamp", "User ID", "Listing", "App Store Link", "Play Store Link",
-                "Annual Revenue", "Marketing Cost", "Server Cost", "Annual Profit",
-                "Revenue Type", "Email", "Valuation"
-            ]
-            _worksheet.insert_row(headers, index=1)
+            _worksheet.insert_row(SHEET_HEADERS, index=1)
+        # ensure header row contains all required columns (if sheet existed but different headers)
+        try:
+            existing = _worksheet.row_values(1)
+            if len(existing) < len(SHEET_HEADERS) or existing[:len(SHEET_HEADERS)] != SHEET_HEADERS:
+                # update header row to canonical headers (keeps data below)
+                _worksheet.delete_row(1)
+                _worksheet.insert_row(SHEET_HEADERS, index=1)
+        except Exception:
+            pass
         app.logger.info("Google Sheets initialized: %s", SHEET_NAME)
         _gs_init_error = None
         return _worksheet
@@ -80,7 +94,7 @@ def try_init_gs():
         app.logger.error(_gs_init_error)
         return None
 
-# ---------- WhatsApp helpers ----------
+# ---------------- WhatsApp helpers ----------------
 def send_whatsapp_text(to, text):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         app.logger.debug("WhatsApp not configured - skipping send.")
@@ -112,7 +126,7 @@ def send_whatsapp_buttons(to, text, buttons):
     except Exception as e:
         app.logger.error("WA send failed: %s", e)
 
-# ---------- Validation & parsing ----------
+# ---------------- Validation & parsing ----------------
 def is_valid_url(u, store):
     if not u: return False
     u = u.strip()
@@ -137,9 +151,7 @@ def parse_number(s):
         if s is None:
             return None
         cleaned = str(s).strip()
-        # remove currency symbols, spaces and commas
         cleaned = cleaned.replace(",", "")
-        # remove any leading non-digit (like $) - keep minus and dot
         cleaned = "".join(ch for ch in cleaned if (ch.isdigit() or ch in ".-"))
         if cleaned == "" or cleaned == "-" or cleaned == ".":
             return None
@@ -154,37 +166,35 @@ def is_valid_email(e):
 def normalize_revenue_type(raw: str):
     if not raw: return ""
     s = raw.strip().lower()
-    # map user-friendly inputs into tokens function checks for
     if "ad" in s:
         return "ad"
     if "sub" in s or "subscription" in s:
         return "subscription"
     if "iap" in s or "in-app" in s or "in app" in s:
         return "iap"
-    # fallback
     return s
 
-# ---------- Valuation compute (for sheet/WA consistency) ----------
+# ---------------- Valuation compute ----------------
 def compute_valuation(profit_val, revenue_type_text):
     try:
-        p = float(profit_val) if profit_val not in (None,"") else 0.0
+        profit = float(profit_val) if profit_val not in (None,"") else 0.0
     except:
-        p = 0.0
+        profit = 0.0
     rt = (revenue_type_text or "").lower()
-    if p <= 0 or p < 1000:
+    if profit <= 0 or profit < 1000:
         return 1000.0, 1000.0, 1000.0
     if "ad" in rt:
-        vmin = p * 1.0; vmax = p * 1.7
+        vmin = profit * 1.0; vmax = profit * 1.7
     elif "subscription" in rt or "sub" in rt:
-        vmin = p * 1.5; vmax = p * 2.3
+        vmin = profit * 1.5; vmax = profit * 2.3
     elif "iap" in rt:
-        vmin = p * 1.5; vmax = p * 2.0
+        vmin = profit * 1.5; vmax = profit * 2.0
     else:
-        vmin = p * 2.5; vmax = p * 2.5
+        vmin = profit * 2.5; vmax = profit * 2.5
     return vmin, vmax, (vmin + vmax) / 2.0
 
-# ---------- Save to Google Sheets ----------
-def save_to_sheet(user_id, answers, valuation_text):
+# ---------------- Save to sheet ----------------
+def save_to_sheet(user_id, answers, valuation_mid):
     ws = try_init_gs()
     if ws is None:
         app.logger.warning("Skipping sheet save: %s", _gs_init_error)
@@ -194,6 +204,7 @@ def save_to_sheet(user_id, answers, valuation_text):
     play_store_link = answers.get("play_store_link","")
     row = [
         now,
+        answers.get("name",""),
         user_id,
         answers.get("listing",""),
         app_store_link,
@@ -204,7 +215,7 @@ def save_to_sheet(user_id, answers, valuation_text):
         answers.get("annual_profit",""),
         answers.get("revenue_type_normalized",""),
         answers.get("email",""),
-        valuation_text
+        valuation_mid  # numeric midpoint
     ]
     try:
         ws.append_row(row)
@@ -214,35 +225,25 @@ def save_to_sheet(user_id, answers, valuation_text):
         app.logger.error("Failed to append row: %s", e)
         return False
 
-# ---------- Call Supabase function (match their expected fields) ----------
-def call_supabase_send_email_for_existing_function(answers, valuation_text):
-    """
-    The Supabase function expects:
-      name, revenueType, appLink, revenue, marketingCost, serverCost, profit, email, phone
-    We'll send those keys and ensure profit is numeric (no commas) so Number(profit) works.
-    """
+# ---------------- Call Supabase function (existing) ----------------
+def call_supabase_send_email_for_existing_function(answers, valuation_text, valuation_mid):
     url = SUPABASE_FUNCTION_URL
     if not url:
         app.logger.warning("No SUPABASE_FUNCTION_URL configured.")
         return False, "No function URL"
 
-    # build payload mapping to the existing function's parameter names
-    # choose a single appLink: if both provided, prefer Play store link in appLink and add extra appStoreLink
+    # pick a single appLink per function expectation
     app_link = ""
     if answers.get("play_store_link"):
         app_link = answers.get("play_store_link")
     elif answers.get("app_store_link"):
         app_link = answers.get("app_store_link")
 
-    # numeric cleaning
     revenue_val = parse_number(answers.get("annual_revenue", None))
     marketing_val = parse_number(answers.get("marketing_cost", None))
     server_val = parse_number(answers.get("server_cost", None))
     profit_val = parse_number(answers.get("annual_profit", None))
-
-    # ensure a numeric profit is sent. If parse_number fails and original looks numeric-ish with commas, try removing commas
     if profit_val is None:
-        # fallback: try removing commas only
         raw = str(answers.get("annual_profit","")).replace(",","").strip()
         try:
             profit_val = float(raw) if raw not in ("", None) else 0.0
@@ -251,6 +252,7 @@ def call_supabase_send_email_for_existing_function(answers, valuation_text):
 
     normalized_rt = normalize_revenue_type(answers.get("revenue_type_normalized") or answers.get("revenue_type_raw") or answers.get("revenue_type",""))
 
+    # build function payload using exactly the keys their function expects
     payload = {
         "name": answers.get("name",""),
         "revenueType": normalized_rt,
@@ -258,26 +260,32 @@ def call_supabase_send_email_for_existing_function(answers, valuation_text):
         "revenue": revenue_val if revenue_val is not None else "",
         "marketingCost": marketing_val if marketing_val is not None else "",
         "serverCost": server_val if server_val is not None else "",
-        # *** CRITICAL: send profit as plain number, not string with commas ***
         "profit": profit_val if profit_val is not None else 0,
         "email": answers.get("email",""),
-        # function expects phone even if you don't collect it — send empty string
-        "phone": answers.get("phone","")
+        "phone": "",  # we don't collect phone
+        # extra helpful fields (function will ignore unknown keys)
+        "_valuation_text": valuation_text,
+        "_valuation_mid": valuation_mid,
+        "_annual_profit_numeric": profit_val,
+        "_revenue_type_normalized": normalized_rt,
+        "force_valuation_hint": True
     }
 
-    # add additional helpful fields (function will ignore unknown fields but they don't hurt)
-    payload["_valuation_text"] = valuation_text
-    payload["_annual_profit_numeric"] = profit_val
-    payload["_revenue_type_normalized"] = normalized_rt
-    payload["force_valuation_hint"] = True
+    # Add CCs if configured
+    cc_list = []
+    if CC_EMAILS:
+        # parse comma-separated env var
+        cc_list = [e.strip() for e in CC_EMAILS.split(",") if e.strip()]
+        if cc_list:
+            payload["cc_emails"] = cc_list
+            payload["cc"] = ", ".join(cc_list)
 
     headers = {"Content-Type":"application/json"}
     if SUPABASE_API_KEY:
         headers["Authorization"] = f"Bearer {SUPABASE_API_KEY}"
 
-    app.logger.info("Calling Supabase function (existing) with payload summary: name=%s email=%s profit=%s rt=%s valuation=%s",
-                    payload["name"], payload["email"], payload["profit"], payload["revenueType"], valuation_text)
-
+    app.logger.info("Calling Supabase function with payload summary: name=%s email=%s profit=%s rt=%s valuation_mid=%s cc=%s",
+                    payload["name"], payload["email"], payload["profit"], payload["revenueType"], payload["_valuation_mid"], payload.get("cc",""))
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=15)
         app.logger.info("Supabase function returned status=%s text=%s", r.status_code, (r.text[:300] + "...") if r.text and len(r.text)>300 else r.text)
@@ -286,12 +294,11 @@ def call_supabase_send_email_for_existing_function(answers, valuation_text):
         app.logger.exception("Failed calling Supabase function: %s", e)
         return False, str(e)
 
-# ---------- Conversation flow (name-first, listing, validation) ----------
+# ---------------- Conversation flow ----------------
 user_states = {}
 processed_msg_ids = set()
 SESSION_TIMEOUT_SECONDS = 15 * 60
 
-# QUESTIONS template
 OTHER_QUESTIONS = [
     {"key":"annual_revenue","text":"What is your annual revenue (USD)? (numbers only, e.g. 250000)","type":"number"},
     {"key":"marketing_cost","text":"What is your annual marketing cost (USD)?","type":"number"},
@@ -412,7 +419,7 @@ def webhook():
                 app.logger.debug("Ignored stray yes/no from %s mid-flow", user_id)
                 continue
 
-            # normal flow: step>=1 maps to questions[step-1]
+            # normal flow
             q_index = state["step"] - 1
             if q_index < 0 or q_index >= len(state.get("questions", [])):
                 send_whatsapp_text(user_id, "Unexpected state. Please say Hi to restart.")
@@ -423,7 +430,6 @@ def webhook():
             key = q["key"]
             val = incoming
 
-            # validations
             valid = True
             if q["type"] == "number":
                 if not is_number(val):
@@ -455,8 +461,6 @@ def webhook():
 
             # save answer
             if q["type"] == "revenue":
-                # normalize revenue types; user can reply "1,3" or "Ad,IAP"
-                # store both raw and normalized
                 raw = val
                 norm = []
                 parts = [p.strip().lower() for p in raw.replace(";",",").split(",") if p.strip()]
@@ -473,7 +477,6 @@ def webhook():
                         norm.append("subscription")
                     elif "iap" in p:
                         norm.append("iap")
-                # dedupe preserve order
                 seen = set(); final = []
                 for it in norm:
                     if it not in seen:
@@ -488,18 +491,14 @@ def webhook():
             next_idx = state["step"] - 1
             if next_idx < len(state.get("questions", [])):
                 send_whatsapp_text(user_id, state["questions"][next_idx]["text"])
-                # convenience buttons for revenue_type
                 if state["questions"][next_idx]["key"] == "revenue_type":
                     send_whatsapp_buttons(user_id, "Tap a button for single option or reply with numbers/names for multiple (e.g. 1,3 or Ad,IAP).", ["IAP","Subscription","Ad"])
                 continue
 
-            # finished
+            # finished collecting
             answers = state["answers"]
-            # ensure normalized revenue string exists
             answers["revenue_type_normalized"] = answers.get("revenue_type_normalized","")
-            # compute numeric profit to drive WA valuation and to send to function
             profit_numeric = parse_number(answers.get("annual_profit", None)) or 0.0
-            # final normalized revenue type for function
             normalized_rt = normalize_revenue_type(answers.get("revenue_type_normalized") or answers.get("revenue_type_raw") or "")
 
             vmin, vmax, mid = compute_valuation(profit_numeric, normalized_rt)
@@ -508,11 +507,13 @@ def webhook():
             else:
                 valuation_text = f"${vmin:,.2f} to ${vmax:,.2f}"
 
-            # save to sheet
-            saved = save_to_sheet(user_id, answers, valuation_text)
+            # Save midpoint numeric into sheet
+            valuation_mid = float(mid)
 
-            # call Supabase function with fields expected by the function you cannot edit
-            ok, resp = call_supabase_send_email_for_existing_function(answers, valuation_text)
+            saved = save_to_sheet(user_id, answers, valuation_mid)
+
+            # call supabase function (existing) - includes _valuation_text and cc emails
+            ok, resp = call_supabase_send_email_for_existing_function(answers, valuation_text, valuation_mid)
 
             if ok:
                 send_whatsapp_text(user_id, f"✅ Thank you {answers.get('name','')}. We've sent your valuation ({valuation_text}) to your email.")
