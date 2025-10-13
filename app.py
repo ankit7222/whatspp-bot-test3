@@ -533,9 +533,9 @@ def webhook():
             ok, resp = call_supabase_send_email_for_existing_function(answers, valuation_text, valuation_mid)
 
             if ok:
-                send_whatsapp_text(user_id, f"✅ Thank you {answers.get('name','')}. We've sent your valuation ({valuation_text}) to your email.")
+                send_whatsapp_text(user_id, f"✅ Thank you {answers.get('name','')}.We've sent your valuation to your email. The final valuation may vary slightly based on the data during processing")
             else:
-                send_whatsapp_text(user_id, "✅ Saved your data, but we couldn't send the email automatically. Please contact aman@kalagato.co if needed.")
+                send_whatsapp_text(user_id, "✅ Saved your data, but we couldn't send the email automatically. Please visit www.kalagato.ai to get valuation.")
                 app.logger.warning("Supabase function failed: %s", resp)
 
             # cleanup
